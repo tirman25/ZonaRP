@@ -5,7 +5,9 @@ import os
 import re
 import uuid
 import html
+import calendar
 import aiosqlite
+from datetime import datetime, timezone
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, InlineQueryResultArticle, InputTextMessageContent, ChosenInlineResult
@@ -13,6 +15,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.exceptions import TelegramBadRequest
 
 from config import BOT_TOKEN, BOT_NAME, ADMIN_IDS, MIN_NICKNAME_LENGTH, MAX_NICKNAME_LENGTH, MIN_COMMAND_NAME_LENGTH, MAX_COMMAND_NAME_LENGTH, REPORT_REASONS, PROXY_URL, DATABASE_PATH
 
@@ -358,6 +361,13 @@ async def update_command_field(command_id: int, field: str, value: str) -> bool:
 async def create_report(command_id: int, reporter_id: int, reason: str) -> bool:
     async with aiosqlite.connect(DATABASE_PATH) as db:
         try:
+            cursor = await db.execute(
+                "SELECT 1 FROM reports WHERE command_id = ? AND reporter_id = ? LIMIT 1",
+                (command_id, reporter_id)
+            )
+            if await cursor.fetchone():
+                return False
+
             await db.execute("INSERT INTO reports (command_id, reporter_id, reason) VALUES (?, ?, ?)", (command_id, reporter_id, reason))
             await db.commit()
             return True
@@ -446,6 +456,292 @@ async def get_blocked_users(limit: int = 20) -> list:
         rows = await cursor.fetchall()
         return [dict(row) for row in rows]
 
+
+async def get_users_count(status_filter: str = "all") -> int:
+    where_parts = []
+    if status_filter == "blk":
+        where_parts.append("b.user_id IS NOT NULL")
+    elif status_filter == "act":
+        where_parts.append("b.user_id IS NULL")
+
+    where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cursor = await db.execute(
+            f"""
+            SELECT COUNT(*)
+            FROM users u
+            LEFT JOIN blocked_users b ON b.user_id = u.user_id
+            {where_sql}
+            """
+        )
+        return (await cursor.fetchone())[0]
+
+
+async def get_admin_users_page(page: int = 0, per_page: int = 8, status_filter: str = "all", sort_by: str = "use") -> list:
+    where_parts = []
+    if status_filter == "blk":
+        where_parts.append("b.user_id IS NOT NULL")
+    elif status_filter == "act":
+        where_parts.append("b.user_id IS NULL")
+
+    where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+
+    order_map = {
+        "use": "total_uses DESC, active_commands DESC, u.created_at DESC",
+        "new": "u.created_at DESC",
+        "cmd": "active_commands DESC, total_uses DESC, u.created_at DESC"
+    }
+    order_sql = order_map.get(sort_by, order_map["use"])
+
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        offset = page * per_page
+        cursor = await db.execute(
+            f"""
+            SELECT
+                u.user_id,
+                u.nickname,
+                COALESCE(SUM(CASE WHEN c.is_active = 1 THEN 1 ELSE 0 END), 0) AS active_commands,
+                COALESCE(SUM(c.uses), 0) AS total_uses,
+                COALESCE(SUM(c.likes), 0) AS total_likes,
+                CASE WHEN b.user_id IS NOT NULL THEN 1 ELSE 0 END AS is_blocked
+            FROM users u
+            LEFT JOIN commands c ON c.creator_id = u.user_id
+            LEFT JOIN blocked_users b ON b.user_id = u.user_id
+            {where_sql}
+            GROUP BY u.user_id, u.nickname, b.user_id
+            ORDER BY {order_sql}
+            LIMIT ? OFFSET ?
+            """,
+            (per_page, offset)
+        )
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+
+async def get_admin_user_profile(user_id: int) -> dict:
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """
+            SELECT
+                u.user_id,
+                u.nickname,
+                u.created_at,
+                CASE WHEN b.user_id IS NOT NULL THEN 1 ELSE 0 END AS is_blocked,
+                b.blocked_at,
+                b.reason AS block_reason,
+                COALESCE(COUNT(c.id), 0) AS commands_total,
+                COALESCE(SUM(CASE WHEN c.is_active = 1 THEN 1 ELSE 0 END), 0) AS commands_active,
+                COALESCE(SUM(CASE WHEN c.is_active = 0 THEN 1 ELSE 0 END), 0) AS commands_inactive,
+                COALESCE(SUM(CASE WHEN c.visibility = 'public' AND c.is_active = 1 THEN 1 ELSE 0 END), 0) AS commands_public,
+                COALESCE(SUM(CASE WHEN c.visibility = 'private' AND c.is_active = 1 THEN 1 ELSE 0 END), 0) AS commands_private,
+                COALESCE(SUM(c.uses), 0) AS total_uses,
+                COALESCE(SUM(c.likes), 0) AS total_likes
+            FROM users u
+            LEFT JOIN commands c ON c.creator_id = u.user_id
+            LEFT JOIN blocked_users b ON b.user_id = u.user_id
+            WHERE u.user_id = ?
+            GROUP BY u.user_id, u.nickname, u.created_at, b.user_id, b.blocked_at, b.reason
+            LIMIT 1
+            """,
+            (user_id,)
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+
+async def get_admin_user_commands_count(user_id: int) -> int:
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cursor = await db.execute("SELECT COUNT(*) FROM commands WHERE creator_id = ?", (user_id,))
+        return (await cursor.fetchone())[0]
+
+
+async def get_admin_user_commands(user_id: int, page: int = 0, per_page: int = 6) -> list:
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        offset = page * per_page
+        cursor = await db.execute(
+            """
+            SELECT c.*, u.nickname AS creator_nickname
+            FROM commands c
+            JOIN users u ON c.creator_id = u.user_id
+            WHERE c.creator_id = ?
+            ORDER BY c.created_at DESC
+            LIMIT ? OFFSET ?
+            """,
+            (user_id, per_page, offset)
+        )
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+    
+
+async def get_admin_commands_count(status_filter: str = "all", visibility_filter: str = "all") -> int:
+    where_parts = []
+    if status_filter == "act":
+        where_parts.append("c.is_active = 1")
+    elif status_filter == "del":
+        where_parts.append("c.is_active = 0")
+
+    if visibility_filter == "pub":
+        where_parts.append("c.visibility = 'public'")
+    elif visibility_filter == "prv":
+        where_parts.append("c.visibility = 'private'")
+
+    where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cursor = await db.execute(f"SELECT COUNT(*) FROM commands c {where_sql}")
+        return (await cursor.fetchone())[0]
+
+
+async def get_admin_commands_page(page: int = 0, per_page: int = 8, status_filter: str = "all", visibility_filter: str = "all", sort_by: str = "new") -> list:
+    where_parts = []
+    if status_filter == "act":
+        where_parts.append("c.is_active = 1")
+    elif status_filter == "del":
+        where_parts.append("c.is_active = 0")
+
+    if visibility_filter == "pub":
+        where_parts.append("c.visibility = 'public'")
+    elif visibility_filter == "prv":
+        where_parts.append("c.visibility = 'private'")
+
+    where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+
+    order_map = {
+        "new": "c.created_at DESC",
+        "old": "c.created_at ASC",
+        "use": "c.uses DESC, c.created_at DESC",
+        "like": "c.likes DESC, c.created_at DESC"
+    }
+    order_sql = order_map.get(sort_by, order_map["new"])
+
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        offset = page * per_page
+        cursor = await db.execute(
+            f"""
+            SELECT c.*, u.nickname AS creator_nickname
+            FROM commands c
+            JOIN users u ON c.creator_id = u.user_id
+            {where_sql}
+            ORDER BY {order_sql}
+            LIMIT ? OFFSET ?
+            """,
+            (per_page, offset)
+        )
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+
+async def restore_command(command_id: int):
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute("UPDATE commands SET is_active = 1 WHERE id = ?", (command_id,))
+        await db.commit()
+
+
+async def resolve_pending_reports_for_command(command_id: int, status: str = "approved"):
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute(
+            "UPDATE reports SET status = ? WHERE command_id = ? AND status = 'pending'",
+            (status, command_id)
+        )
+        await db.commit()
+
+
+async def get_stats_by_period(period: str = "all") -> dict:
+    period_map = {
+        "today": "date('now', 'localtime')",
+        "week": "date('now', '-6 days', 'localtime')",
+        "month": "date('now', 'start of month', 'localtime')",
+        "all": None
+    }
+    start_expr = period_map.get(period, None)
+
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        stats = {}
+
+        users_q = "SELECT COUNT(*) FROM users"
+        commands_q = "SELECT COUNT(*) FROM commands"
+        uses_q = "SELECT COALESCE(SUM(uses), 0) FROM commands"
+        likes_q = "SELECT COALESCE(SUM(likes), 0) FROM commands"
+        reports_q = "SELECT COUNT(*) FROM reports"
+
+        if start_expr:
+            users_q += f" WHERE date(created_at) >= {start_expr}"
+            commands_q += f" WHERE date(created_at) >= {start_expr}"
+            uses_q += f" WHERE date(created_at) >= {start_expr}"
+            likes_q += f" WHERE date(created_at) >= {start_expr}"
+            reports_q += f" WHERE date(created_at) >= {start_expr}"
+
+        cursor = await db.execute(users_q)
+        stats['users'] = (await cursor.fetchone())[0]
+
+        cursor = await db.execute(commands_q)
+        stats['commands'] = (await cursor.fetchone())[0]
+
+        cursor = await db.execute(uses_q)
+        stats['total_uses'] = (await cursor.fetchone())[0] or 0
+
+        cursor = await db.execute(likes_q)
+        stats['total_likes'] = (await cursor.fetchone())[0] or 0
+
+        cursor = await db.execute(reports_q)
+        stats['reports'] = (await cursor.fetchone())[0]
+
+        cursor = await db.execute("SELECT COUNT(*) FROM commands WHERE is_active = 1")
+        stats['active_commands_total'] = (await cursor.fetchone())[0]
+
+        cursor = await db.execute("SELECT COUNT(*) FROM blocked_users")
+        stats['blocked_users_total'] = (await cursor.fetchone())[0]
+
+        return stats
+
+
+async def get_stats_by_date_range(date_from: str, date_to: str) -> dict:
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        stats = {}
+
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM users WHERE date(created_at) BETWEEN date(?) AND date(?)",
+            (date_from, date_to)
+        )
+        stats['users'] = (await cursor.fetchone())[0]
+
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM commands WHERE date(created_at) BETWEEN date(?) AND date(?)",
+            (date_from, date_to)
+        )
+        stats['commands'] = (await cursor.fetchone())[0]
+    
+        cursor = await db.execute(
+            "SELECT COALESCE(SUM(uses), 0) FROM commands WHERE date(created_at) BETWEEN date(?) AND date(?)",
+            (date_from, date_to)
+        )
+        stats['total_uses'] = (await cursor.fetchone())[0] or 0
+
+        cursor = await db.execute(
+            "SELECT COALESCE(SUM(likes), 0) FROM commands WHERE date(created_at) BETWEEN date(?) AND date(?)",
+            (date_from, date_to)
+        )
+        stats['total_likes'] = (await cursor.fetchone())[0] or 0
+
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM reports WHERE date(created_at) BETWEEN date(?) AND date(?)",
+            (date_from, date_to)
+        )
+        stats['reports'] = (await cursor.fetchone())[0]
+
+        cursor = await db.execute("SELECT COUNT(*) FROM commands WHERE is_active = 1")
+        stats['active_commands_total'] = (await cursor.fetchone())[0]
+
+        cursor = await db.execute("SELECT COUNT(*) FROM blocked_users")
+        stats['blocked_users_total'] = (await cursor.fetchone())[0]
+
+        return stats
+
 # ============= STATES =============
 
 class RegisterState(StatesGroup):
@@ -499,11 +795,67 @@ def get_main_keyboard(user_id: int) -> InlineKeyboardMarkup:
         builder.button(text="👑 Админ-панель", callback_data="menu_admin")
     builder.adjust(2)
     return builder.as_markup()
+    
+
+def get_main_menu_text(nickname: str) -> str:
+    return (
+        f"👋 <b>Привет, {html.escape(nickname)}!</b>\n\n"
+        f"Выбирай раздел ниже 👇"
+    )
 
 def get_back_keyboard(callback_data: str = "back_main") -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.button(text="◀️ Назад", callback_data=callback_data)
     return builder.as_markup()
+
+
+def get_page_picker_keyboard(base_callback: str, current_page: int, total_pages: int, back_callback: str) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    
+    total_pages = max(1, total_pages)
+    current_page = max(0, min(current_page, total_pages - 1))
+
+    if total_pages <= 15:
+        pages = list(range(total_pages))
+    else:
+        start = max(0, current_page - 4)
+        end = min(total_pages, start + 9)
+        if end - start < 9:
+            start = max(0, end - 9)
+        pages = list(range(start, end))
+
+    for p in pages:
+        text = f"·{p+1}·" if p == current_page else str(p + 1)
+        builder.button(text=text, callback_data=f"{base_callback}_{p}")
+
+    builder.adjust(5)
+    builder.button(text="◀️ Назад", callback_data=back_callback)
+    return builder.as_markup()
+
+
+async def safe_edit_message(callback: types.CallbackQuery, text: str, *, parse_mode: str | None = None, reply_markup: InlineKeyboardMarkup | None = None, disable_web_page_preview: bool | None = None):
+    try:
+        await callback.message.edit_text(
+            text,
+            parse_mode=parse_mode,
+            reply_markup=reply_markup,
+            disable_web_page_preview=disable_web_page_preview
+        )
+    except TelegramBadRequest as e:
+        if "message is not modified" in str(e):
+            return
+        raise
+
+
+def format_db_datetime(value: str | None) -> str:
+    if not value:
+        return "-"
+    try:
+        dt_utc = datetime.fromisoformat(str(value).replace(" ", "T")).replace(tzinfo=timezone.utc)
+        return dt_utc.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return str(value)
+
 
 def get_commands_keyboard(commands: list, page: int = 0, total_pages: int = 1, prefix: str = "cmd") -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
@@ -515,7 +867,7 @@ def get_commands_keyboard(commands: list, page: int = 0, total_pages: int = 1, p
         )
     
     builder.adjust(1)
-    
+
     if total_pages > 1:
         nav_buttons = []
         if page > 0:
@@ -564,7 +916,7 @@ def get_visibility_keyboard() -> InlineKeyboardMarkup:
     builder.button(text="◀️ Отмена", callback_data="back_main")
     builder.adjust(1)
     return builder.as_markup()
-    
+
 
 def get_type_keyboard() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
@@ -608,22 +960,445 @@ def get_admin_reports_keyboard(reports: list, page: int, total_pages: int) -> In
         nav_buttons = []
         if page > 0:
             nav_buttons.append(InlineKeyboardButton(text="◀️", callback_data=f"admin_reports_page_{page-1}"))
-        nav_buttons.append(InlineKeyboardButton(text=f"{page+1}/{total_pages}", callback_data="noop"))
+        nav_buttons.append(InlineKeyboardButton(text=f"{page+1}/{total_pages}", callback_data=f"admin_reports_pick_{page}_{total_pages}"))
         if page < total_pages - 1:
             nav_buttons.append(InlineKeyboardButton(text="▶️", callback_data=f"admin_reports_page_{page+1}"))
         builder.row(*nav_buttons)
 
     builder.button(text="◀️ Назад", callback_data="menu_admin")
     return builder.as_markup()
-    
+
 
 def get_admin_report_actions_keyboard(report_id: int, command_id: int, creator_id: int, command_is_active: bool = True) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
+    builder.button(text="🔎 Открыть команду", callback_data=f"admin_cmd_{command_id}")
+    builder.button(text="👤 Открыть профиль автора", callback_data=f"admin_user_{creator_id}")
     builder.button(text="✅ Отклонить жалобу", callback_data=f"resolve_{report_id}_reject")
     if command_is_active:
         builder.button(text="🗑️ Удалить команду", callback_data=f"delete_cmd_{command_id}")
     builder.button(text="🚫 Заблокировать автора", callback_data=f"admin_block_from_report_{report_id}_{creator_id}")
     builder.button(text="◀️ К списку жалоб", callback_data="admin_reports")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def get_admin_main_keyboard(report_count: int) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text=f"📋 Жалобы ({report_count})", callback_data="admin_reports")
+    builder.button(text="👥 Пользователи", callback_data="admin_users")
+    builder.button(text="🎯 Команды", callback_data="admin_commands")
+    builder.button(text="🚫 Заблокированные", callback_data="admin_blocked")
+    builder.button(text="📊 Статистика", callback_data="admin_stats")
+    builder.button(text="◀️ Меню", callback_data="back_main")
+    builder.adjust(1)
+    return builder.as_markup()
+    
+
+def get_admin_users_keyboard(users: list, page: int, total_pages: int, status_filter: str = "all", sort_by: str = "use") -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+
+    for u in users:
+        blocked_mark = "🚫 " if u.get('is_blocked') else ""
+        builder.button(
+            text=f"{blocked_mark}{u['nickname']} · cmd {u['active_commands']} · use {u['total_uses']}",
+            callback_data=f"admin_user_{u['user_id']}"
+        )
+
+    builder.adjust(1)
+
+    status_label = {
+        "all": "Все",
+        "act": "Активные",
+        "blk": "Блок"
+    }.get(status_filter, "Все")
+
+    sort_label = {
+        "use": "Использования",
+        "new": "Новые",
+        "cmd": "Команды"
+    }.get(sort_by, "Использования")
+
+    builder.row(
+        InlineKeyboardButton(text=f"👤 {status_label}", callback_data=f"admin_users_filter_menu_{status_filter}_{sort_by}"),
+        InlineKeyboardButton(text=f"↕️ {sort_label}", callback_data=f"admin_users_sort_menu_{status_filter}_{sort_by}")
+    )
+
+    if total_pages > 1:
+        nav_buttons = []
+        if page > 0:
+            nav_buttons.append(InlineKeyboardButton(text="◀️", callback_data=f"admin_users_page_{status_filter}_{sort_by}_{page-1}"))
+        nav_buttons.append(InlineKeyboardButton(text=f"{page+1}/{total_pages}", callback_data=f"admin_users_pick_{status_filter}_{sort_by}_{page}_{total_pages}"))
+        if page < total_pages - 1:
+            nav_buttons.append(InlineKeyboardButton(text="▶️", callback_data=f"admin_users_page_{status_filter}_{sort_by}_{page+1}"))
+        builder.row(*nav_buttons)
+
+    builder.button(text="◀️ Назад", callback_data="menu_admin")
+    return builder.as_markup()
+
+
+def get_admin_user_profile_keyboard(user_id: int, is_blocked: bool) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🎯 Команды пользователя", callback_data=f"admin_user_cmds_{user_id}")
+    if is_blocked:
+        builder.button(text="✅ Разблокировать", callback_data=f"admin_unblock_user_{user_id}")
+    else:
+        builder.button(text="🚫 Заблокировать", callback_data=f"admin_block_user_{user_id}")
+    builder.button(text="◀️ К пользователям", callback_data="admin_users")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def get_admin_user_commands_keyboard(commands: list, user_id: int, page: int, total_pages: int) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+
+    for cmd in commands:
+        status = "✅" if cmd.get('is_active') else "🗑️"
+        visibility = "🔒" if cmd.get('visibility') == 'private' else "🌐"
+        cmd_type = "👤" if cmd.get('command_type') == 'self' else "👥"
+        builder.button(
+            text=f"{status} {visibility} {cmd_type} {cmd['name']} · {cmd['uses']}× · ❤️ {cmd['likes']}",
+            callback_data=f"admin_user_cmd_{cmd['id']}_{user_id}"
+        )
+
+    builder.adjust(1)
+
+    if total_pages > 1:
+        nav_buttons = []
+        if page > 0:
+            nav_buttons.append(InlineKeyboardButton(text="◀️", callback_data=f"admin_user_cmds_page_{user_id}_{page-1}"))
+        nav_buttons.append(InlineKeyboardButton(text=f"{page+1}/{total_pages}", callback_data=f"admin_user_cmds_pick_{user_id}_{page}_{total_pages}"))
+        if page < total_pages - 1:
+            nav_buttons.append(InlineKeyboardButton(text="▶️", callback_data=f"admin_user_cmds_page_{user_id}_{page+1}"))
+        builder.row(*nav_buttons)
+
+    builder.button(text="◀️ В профиль", callback_data=f"admin_user_{user_id}")
+    return builder.as_markup()
+
+
+def get_admin_commands_keyboard(commands: list, page: int, total_pages: int, status_filter: str = "all", visibility_filter: str = "all", sort_by: str = "new") -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+
+    for cmd in commands:
+        status = "✅" if cmd.get('is_active') else "🗑️"
+        visibility = "🔒" if cmd.get('visibility') == 'private' else "🌐"
+        builder.button(
+            text=f"{status} {visibility} {cmd['name']} · @{cmd['creator_nickname']}",
+            callback_data=f"admin_cmd_{cmd['id']}"
+        )
+
+    builder.adjust(1)
+    
+    status_label = {
+        "all": "Все",
+        "act": "Активные",
+        "del": "Удалённые"
+    }.get(status_filter, "Все")
+
+    visibility_label = {
+        "all": "Все",
+        "pub": "Публичные",
+        "prv": "Приватные"
+    }.get(visibility_filter, "Все")
+
+    sort_label = {
+        "new": "Новые",
+        "old": "Старые",
+        "use": "Использования",
+        "like": "Лайки"
+    }.get(sort_by, "Новые")
+
+    builder.row(
+        InlineKeyboardButton(text=f"📦 {status_label}", callback_data=f"admin_commands_filter_status_menu_{status_filter}_{visibility_filter}_{sort_by}"),
+        InlineKeyboardButton(text=f"👁️ {visibility_label}", callback_data=f"admin_commands_filter_visibility_menu_{status_filter}_{visibility_filter}_{sort_by}")
+    )
+    builder.row(
+        InlineKeyboardButton(text=f"↕️ {sort_label}", callback_data=f"admin_commands_sort_menu_{status_filter}_{visibility_filter}_{sort_by}")
+    )
+
+    if total_pages > 1:
+        nav_buttons = []
+        if page > 0:
+            nav_buttons.append(InlineKeyboardButton(text="◀️", callback_data=f"admin_commands_page_{status_filter}_{visibility_filter}_{sort_by}_{page-1}"))
+        nav_buttons.append(InlineKeyboardButton(text=f"{page+1}/{total_pages}", callback_data=f"admin_commands_pick_{status_filter}_{visibility_filter}_{sort_by}_{page}_{total_pages}"))
+        if page < total_pages - 1:
+            nav_buttons.append(InlineKeyboardButton(text="▶️", callback_data=f"admin_commands_page_{status_filter}_{visibility_filter}_{sort_by}_{page+1}"))
+        builder.row(*nav_buttons)
+
+    builder.button(text="◀️ Назад", callback_data="menu_admin")
+    return builder.as_markup()
+
+
+def get_admin_command_actions_keyboard(command_id: int, creator_id: int, is_active: bool, back_callback: str = "admin_commands") -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="👤 Профиль автора", callback_data=f"admin_user_{creator_id}")
+    if is_active:
+        builder.button(text="🗑️ Удалить команду", callback_data=f"admin_delete_cmd_{command_id}")
+    else:
+        builder.button(text="♻️ Восстановить команду", callback_data=f"admin_restore_cmd_{command_id}")
+    builder.button(text="◀️ Назад", callback_data=back_callback)
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def get_admin_stats_keyboard(
+    period: str = "all",
+    filter_type: str | None = None,
+    selected_day: str | None = None,
+    selected_from: str | None = None,
+    selected_to: str | None = None
+) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    period_label = {
+        "today": "Сегодня",
+        "week": "7 дней",
+        "month": "Месяц",
+        "all": "Всё время"
+    }.get(period, "Всё время")
+
+    day_text = "🗓️ Конкретный день"
+    day_cb = "admin_stats_cal_day_now"
+    if filter_type == "day" and selected_day:
+        day_text = f"🗓️ День: {format_human_date_with_weekday(selected_day)}"
+        day_cb = f"admin_stats_cal_day_sel_{selected_day}"
+
+    range_text = "📆 Диапазон дат"
+    range_cb = "admin_stats_cal_range_from_now"
+    if filter_type == "range" and selected_from and selected_to:
+        range_text = f"📆 Период: {format_human_date(selected_from)} → {format_human_date(selected_to)}"
+        range_cb = f"admin_stats_cal_range_show_{selected_from}_{selected_to}"
+    elif filter_type == "range" and selected_from:
+        range_text = f"📆 От: {format_human_date_with_weekday(selected_from)}"
+        range_cb = f"admin_stats_cal_range_from_sel_{selected_from}"
+
+    builder.button(text=f"📅 Период: {period_label}", callback_data="admin_stats_period_menu")
+    builder.button(text=day_text, callback_data=day_cb)
+    builder.button(text=range_text, callback_data=range_cb)
+
+    if filter_type:
+        builder.button(text="♻️ Сбросить фильтр", callback_data="admin_stats_reset_dates")
+
+    builder.button(text="🔄 Обновить", callback_data=f"admin_stats_{period}")
+    builder.button(text="◀️ Назад", callback_data="menu_admin")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def build_calendar_month(year: int, month: int) -> list[list[int]]:
+    return calendar.monthcalendar(year, month)
+
+
+def format_month_title(year: int, month: int) -> str:
+    month_names = [
+        "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
+        "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"
+    ]
+    return f"🗓️ {month_names[month - 1]} {year}"
+
+
+def format_human_date(date_text: str | None) -> str:
+    if not date_text:
+        return "-"
+    try:
+        dt = datetime.strptime(date_text, "%Y-%m-%d")
+        return dt.strftime("%d.%m.%Y")
+    except Exception:
+        return date_text
+
+
+def format_human_date_with_weekday(date_text: str | None) -> str:
+    if not date_text:
+        return "-"
+
+    weekdays = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+
+    try:
+        dt = datetime.strptime(date_text, "%Y-%m-%d")
+        weekday = weekdays[dt.weekday()]
+        return f"{weekday}, {dt.strftime('%d.%m.%Y')}"
+    except Exception:
+        return date_text
+
+
+def format_human_date_full_ru(date_text: str | None) -> str:
+    if not date_text:
+        return "-"
+
+    weekdays = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
+    months = [
+        "января", "февраля", "марта", "апреля", "мая", "июня",
+        "июля", "августа", "сентября", "октября", "ноября", "декабря"
+    ]
+
+    try:
+        dt = datetime.strptime(date_text, "%Y-%m-%d")
+        return f"{weekdays[dt.weekday()]}, {dt.day} {months[dt.month - 1]} {dt.year}"
+    except Exception:
+        return date_text
+
+
+def get_stats_calendar_keyboard(
+    mode: str,
+    year: int,
+    month: int,
+    selected_from: str | None = None,
+    selected_to: str | None = None,
+    back_callback: str | None = None
+) -> InlineKeyboardMarkup:
+    month_name = format_month_title(year, month)
+
+    if mode == "day":
+        title = "📅 Выберите день"
+    elif mode == "range_from":
+        title = "📆 Выберите начало периода"
+    else:
+        title = "📆 Выберите конец периода"
+
+    prev_y, prev_m = (year - 1, 12) if month == 1 else (year, month - 1)
+    next_y, next_m = (year + 1, 1) if month == 12 else (year, month + 1)
+
+    if mode == "day":
+        prev_cb = f"admin_stats_cal_day_{prev_y}_{prev_m}"
+        next_cb = f"admin_stats_cal_day_{next_y}_{next_m}"
+    elif mode == "range_from":
+        prev_cb = f"admin_stats_cal_range_from_{prev_y}_{prev_m}"
+        next_cb = f"admin_stats_cal_range_from_{next_y}_{next_m}"
+    else:
+        prev_cb = f"admin_stats_cal_range_to_{selected_from}_{prev_y}_{prev_m}"
+        next_cb = f"admin_stats_cal_range_to_{selected_from}_{next_y}_{next_m}"
+
+    rows = [
+        [InlineKeyboardButton(text=title, callback_data="noop")],
+        [InlineKeyboardButton(text=f"════ {month_name} ════", callback_data="noop")],
+        [
+            InlineKeyboardButton(text="◀️", callback_data=prev_cb),
+            InlineKeyboardButton(text="▶️", callback_data=next_cb)
+        ],
+        [
+            InlineKeyboardButton(text="Пн", callback_data="noop"),
+            InlineKeyboardButton(text="Вт", callback_data="noop"),
+            InlineKeyboardButton(text="Ср", callback_data="noop"),
+            InlineKeyboardButton(text="Чт", callback_data="noop"),
+            InlineKeyboardButton(text="Пт", callback_data="noop"),
+            InlineKeyboardButton(text="Сб", callback_data="noop"),
+            InlineKeyboardButton(text="Вс", callback_data="noop")
+        ]
+    ]
+
+    current_local_date = datetime.now().astimezone().date()
+
+    for week in build_calendar_month(year, month):
+        week_row = []
+        for day in week:
+            if day == 0:
+                week_row.append(InlineKeyboardButton(text=" ", callback_data="noop"))
+                continue
+
+            btn_date = f"{year:04d}-{month:02d}-{day:02d}"
+            btn_day_date = datetime(year, month, day).date()
+
+            is_future = btn_day_date > current_local_date
+            is_before_from = mode == "range_to" and selected_from and btn_date < selected_from
+
+            day_plain = f"{day:02d}"
+            day_text = day_plain
+            if mode == "day":
+                if selected_from and selected_to:
+                    if selected_from == selected_to and btn_date == selected_from:
+                        day_text = f"•{day_plain}•"
+                    elif btn_date == selected_from:
+                        day_text = f"•{day_plain}"
+                    elif btn_date == selected_to:
+                        day_text = f"{day_plain}•"
+                elif selected_from and btn_date == selected_from:
+                    day_text = f"•{day_plain}•"
+                elif not selected_from and btn_day_date == current_local_date:
+                    day_text = f"•{day_plain}•"
+            else:
+                if selected_from and btn_date == selected_from:
+                    day_text = f"•{day_plain}"
+                if selected_to and btn_date == selected_to:
+                    day_text = f"{day_plain}•"
+
+            if is_future or is_before_from:
+                week_row.append(InlineKeyboardButton(text=day_text, callback_data="noop"))
+                continue
+
+            if mode == "day":
+                cb = f"admin_stats_day_{btn_date}"
+            elif mode == "range_from":
+                cb = f"admin_stats_range_from_{btn_date}"
+            else:
+                cb = f"admin_stats_range_to_{selected_from}_{btn_date}"
+
+            week_row.append(InlineKeyboardButton(text=day_text, callback_data=cb))
+
+        rows.append(week_row)
+
+    if mode == "range_to" and selected_from and selected_to:
+        rows.append([
+            InlineKeyboardButton(
+                text="✅ Показать статистику",
+                callback_data=f"admin_stats_range_apply_{selected_from}_{selected_to}"
+            )
+        ])
+
+    # Кнопка сброса диапазона
+    if mode in {"range_from", "range_to"} and (selected_from or selected_to):
+        rows.append([InlineKeyboardButton(text="♻️ Сбросить", callback_data="admin_stats_cal_range_reset")])
+
+    back_cb = back_callback or ("admin_stats" if mode in {"day", "range_from"} else "admin_stats_cal_range_from_now")
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data=back_cb)])
+
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def get_admin_users_filter_menu_keyboard(current_status: str, current_sort: str) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="👥 Все", callback_data=f"admin_users_apply_status_all_{current_sort}")
+    builder.button(text="✅ Активные", callback_data=f"admin_users_apply_status_act_{current_sort}")
+    builder.button(text="🚫 Заблокированные", callback_data=f"admin_users_apply_status_blk_{current_sort}")
+    builder.button(text="◀️ Назад", callback_data=f"admin_users_page_{current_status}_{current_sort}_0")
+    builder.adjust(1)
+    return builder.as_markup()
+    
+
+def get_admin_users_sort_menu_keyboard(current_status: str, current_sort: str) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🎯 По использованиям", callback_data=f"admin_users_apply_sort_use_{current_status}")
+    builder.button(text="🆕 Сначала новые", callback_data=f"admin_users_apply_sort_new_{current_status}")
+    builder.button(text="🧱 По числу команд", callback_data=f"admin_users_apply_sort_cmd_{current_status}")
+    builder.button(text="◀️ Назад", callback_data=f"admin_users_page_{current_status}_{current_sort}_0")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def get_admin_commands_status_filter_menu_keyboard(current_status: str, current_visibility: str, current_sort: str) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="📦 Все", callback_data=f"admin_commands_apply_status_all_{current_visibility}_{current_sort}")
+    builder.button(text="✅ Активные", callback_data=f"admin_commands_apply_status_act_{current_visibility}_{current_sort}")
+    builder.button(text="🗑️ Удалённые", callback_data=f"admin_commands_apply_status_del_{current_visibility}_{current_sort}")
+    builder.button(text="◀️ Назад", callback_data=f"admin_commands_page_{current_status}_{current_visibility}_{current_sort}_0")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def get_admin_commands_visibility_filter_menu_keyboard(current_status: str, current_visibility: str, current_sort: str) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="👁️ Все", callback_data=f"admin_commands_apply_visibility_all_{current_status}_{current_sort}")
+    builder.button(text="🌐 Публичные", callback_data=f"admin_commands_apply_visibility_pub_{current_status}_{current_sort}")
+    builder.button(text="🔒 Приватные", callback_data=f"admin_commands_apply_visibility_prv_{current_status}_{current_sort}")
+    builder.button(text="◀️ Назад", callback_data=f"admin_commands_page_{current_status}_{current_visibility}_{current_sort}_0")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def get_admin_commands_sort_menu_keyboard(current_status: str, current_visibility: str, current_sort: str) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🆕 Сначала новые", callback_data=f"admin_commands_apply_sort_new_{current_status}_{current_visibility}")
+    builder.button(text="📜 Сначала старые", callback_data=f"admin_commands_apply_sort_old_{current_status}_{current_visibility}")
+    builder.button(text="🎯 По использованиям", callback_data=f"admin_commands_apply_sort_use_{current_status}_{current_visibility}")
+    builder.button(text="❤️ По лайкам", callback_data=f"admin_commands_apply_sort_like_{current_status}_{current_visibility}")
+    builder.button(text="◀️ Назад", callback_data=f"admin_commands_page_{current_status}_{current_visibility}_{current_sort}_0")
     builder.adjust(1)
     return builder.as_markup()
 
@@ -634,11 +1409,11 @@ async def cmd_start(message: types.Message, state: FSMContext):
     await state.clear()
     user_id = message.from_user.id
     user = await get_user(user_id)
-    
+
     if await is_user_blocked(user_id):
         await message.answer("🚫 Вы заблокированы.")
         return
-    
+
     if not user:
         await message.answer(
             f"👋 Добро пожаловать в RP Bot!\n\n"
@@ -648,7 +1423,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
         )
         await state.set_state(RegisterState.waiting_nickname)
         return
-    
+
     start_arg = ""
     if message.text:
         parts = message.text.split(maxsplit=1)
@@ -663,10 +1438,9 @@ async def cmd_start(message: types.Message, state: FSMContext):
         )
         await state.set_state(CreateCommandState.waiting_name)
         return
-    
+
     await message.answer(
-        f"👋 <b>Привет, {html.escape(user['nickname'])}!</b>\n\n"
-        f"Выбирай раздел ниже 👇",
+        get_main_menu_text(user['nickname']),
         parse_mode="HTML",
         reply_markup=get_main_keyboard(user_id)
     )
@@ -675,28 +1449,27 @@ async def cmd_start(message: types.Message, state: FSMContext):
 async def process_nickname(message: types.Message, state: FSMContext):
     nickname = message.text.strip().lower().replace("@", "")
     user_id = message.from_user.id
-    
+
     if not nickname or len(nickname) < MIN_NICKNAME_LENGTH:
         await message.answer(f"❌ Минимум {MIN_NICKNAME_LENGTH} символов! Попробуйте снова:")
         return
-    
+
     if len(nickname) > MAX_NICKNAME_LENGTH:
         await message.answer(f"❌ Максимум {MAX_NICKNAME_LENGTH} символов! Попробуйте снова:")
         return
-    
+
     if ' ' in nickname or not nickname.isalpha() or not nickname.isascii():
         await message.answer("❌ Только английские буквы без пробелов! Попробуйте снова:")
         return
-    
+
     if await is_nickname_taken(nickname):
         await message.answer("❌ Никнейм занят! Выберите другой:")
         return
-    
+
     if await register_user(user_id, nickname):
         await message.answer(
-            f"✅ Успешно!\n\n"
-            f"🎉 Ваш никнейм: {nickname}\n\n"
-            f"📋 Меню:",
+            get_main_menu_text(nickname),
+            parse_mode="HTML",
             reply_markup=get_main_keyboard(user_id)
         )
     else:
@@ -715,10 +1488,9 @@ async def back_to_main(callback: types.CallbackQuery, state: FSMContext):
         await callback.message.edit_text("❌ Напишите /start", reply_markup=None)
         await callback.answer()
         return
-    
+
     await callback.message.edit_text(
-        f"👋 <b>Привет, {html.escape(user['nickname'])}!</b>\n\n"
-        f"Выбирай раздел ниже 👇",
+        get_main_menu_text(user['nickname']),
         parse_mode="HTML",
         reply_markup=get_main_keyboard(user_id)
     )
@@ -728,11 +1500,11 @@ async def back_to_main(callback: types.CallbackQuery, state: FSMContext):
 async def menu_settings(callback: types.CallbackQuery):
     user_id = callback.from_user.id
     user = await get_user(user_id)
-    
+
     if not user:
         await callback.answer("❌ Напишите /start")
         return
-    
+
     builder = InlineKeyboardBuilder()
     builder.button(text="✏️ Изменить ник", callback_data="change_nick")
     builder.button(text="◀️ Меню", callback_data="back_main")
@@ -750,7 +1522,7 @@ async def change_nick_start(callback: types.CallbackQuery, state: FSMContext):
     if not user:
         await callback.answer("❌ Напишите /start")
         return
-    
+
     await callback.message.edit_text(
         f"✏️ Введите новый ник ({MIN_NICKNAME_LENGTH}-{MAX_NICKNAME_LENGTH} символов):",
         reply_markup=get_back_keyboard("menu_settings")
@@ -776,7 +1548,12 @@ async def change_nick_process(message: types.Message, state: FSMContext):
         return
     
     if await update_nickname(user_id, nickname):
-        await message.answer(f"✅ Ник изменён на: {nickname}", reply_markup=get_main_keyboard(user_id))
+        await message.answer(f"✅ Ник изменён на: {nickname}")
+        await message.answer(
+            get_main_menu_text(nickname),
+            parse_mode="HTML",
+            reply_markup=get_main_keyboard(user_id)
+        )
     else:
         await message.answer("❌ Ошибка")
     await state.clear()
@@ -793,7 +1570,7 @@ async def menu_my_commands(callback: types.CallbackQuery):
         )
         await callback.answer()
         return
-    
+
     commands = await get_user_commands(user_id, page=0)
     total_pages = (total + 4) // 5
     
@@ -807,7 +1584,7 @@ async def menu_my_commands(callback: types.CallbackQuery):
 async def my_commands_page(callback: types.CallbackQuery):
     user_id = callback.from_user.id
     page = int(callback.data.split("_")[-1])
-    
+
     total = await get_user_commands_count(user_id)
     commands = await get_user_commands(user_id, page=page)
     total_pages = (total + 4) // 5
@@ -822,7 +1599,7 @@ async def my_commands_page(callback: types.CallbackQuery):
 async def menu_favorites(callback: types.CallbackQuery):
     user_id = callback.from_user.id
     total = await get_user_favorites_count(user_id)
-    
+
     if total == 0:
         await callback.message.edit_text(
             "⭐ Избранное пусто.\n\n💡 Добавляйте команды в избранное для быстрого доступа!",
@@ -830,7 +1607,7 @@ async def menu_favorites(callback: types.CallbackQuery):
         )
         await callback.answer()
         return
-    
+
     commands = await get_user_favorites(user_id, page=0)
     total_pages = (total + 4) // 5
     
@@ -844,7 +1621,7 @@ async def menu_favorites(callback: types.CallbackQuery):
 async def favorites_page(callback: types.CallbackQuery):
     user_id = callback.from_user.id
     page = int(callback.data.split("_")[-1])
-    
+
     total = await get_user_favorites_count(user_id)
     commands = await get_user_favorites(user_id, page=page)
     total_pages = (total + 4) // 5
@@ -1113,9 +1890,15 @@ async def edit_command_field_save(message: types.Message, state: FSMContext):
 
     updated_command = await get_command(command_id)
     if not updated_command:
-        await message.answer("✅ Изменения сохранены", reply_markup=get_main_keyboard(message.from_user.id))
+        user = await get_user(message.from_user.id)
+        await message.answer("✅ Изменения сохранены")
+        await message.answer(
+            get_main_menu_text(user['nickname'] if user else str(message.from_user.id)),
+            parse_mode="HTML",
+            reply_markup=get_main_keyboard(message.from_user.id)
+        )
         return
-    
+
     if updated_command['command_type'] == 'self':
         type_text = "👤 Для себя"
     else:
@@ -1132,14 +1915,17 @@ async def edit_command_field_save(message: types.Message, state: FSMContext):
         f"👤 Автор: <b>{html.escape(updated_command['creator_nickname'])}</b>"
     )
 
+    await message.answer(text, parse_mode="HTML")
+
+    user = await get_user(message.from_user.id)
     await message.answer(
-        text,
+        get_main_menu_text(user['nickname'] if user else str(message.from_user.id)),
         parse_mode="HTML",
         reply_markup=get_main_keyboard(message.from_user.id)
     )
 
 
-@dp.callback_query(F.data.startswith("delete_"))
+@dp.callback_query(F.data.startswith("delete_") & ~F.data.startswith("delete_cmd_"))
 async def delete_command_confirm(callback: types.CallbackQuery):
     command_id = int(callback.data.split("_")[-1])
     command = await get_command(command_id)
@@ -1218,7 +2004,10 @@ async def report_process(callback: types.CallbackQuery):
             reply_markup=get_back_keyboard()
         )
     else:
-        await callback.message.edit_text("❌ Ошибка отправки.", reply_markup=get_back_keyboard())
+        await callback.message.edit_text(
+            "⚠️ Вы уже отправляли жалобу на эту команду.",
+            reply_markup=get_back_keyboard()
+        )
     
     await callback.answer()
 
@@ -1228,15 +2017,15 @@ async def report_process(callback: types.CallbackQuery):
 async def menu_create(callback: types.CallbackQuery, state: FSMContext):
     user_id = callback.from_user.id
     user = await get_user(user_id)
-    
+
     if not user:
         await callback.answer("❌ Напишите /start")
         return
-    
+
     if await is_user_blocked(user_id):
         await callback.answer("🚫 Вы заблокированы!")
         return
-    
+
     await callback.message.edit_text(
         f"➕ Создание команды\n\n"
         f"📝 Название ({MIN_COMMAND_NAME_LENGTH}-{MAX_COMMAND_NAME_LENGTH} символов):",
@@ -1248,15 +2037,15 @@ async def menu_create(callback: types.CallbackQuery, state: FSMContext):
 @dp.message(CreateCommandState.waiting_name)
 async def create_name(message: types.Message, state: FSMContext):
     name = message.text.strip().lower()
-    
+
     if len(name) < MIN_COMMAND_NAME_LENGTH or len(name) > MAX_COMMAND_NAME_LENGTH:
         await message.answer(f"❌ От {MIN_COMMAND_NAME_LENGTH} до {MAX_COMMAND_NAME_LENGTH} символов!")
         return
-    
+
     if ' ' in name or not name.isalnum():
         await message.answer("❌ Только буквы и цифры без пробелов!")
         return
-    
+
     await state.update_data(name=name)
     await message.answer("📝 Описание команды:", reply_markup=get_back_keyboard())
     await state.set_state(CreateCommandState.waiting_description)
@@ -1403,8 +2192,10 @@ async def finish_create(message: types.Message, state: FSMContext):
                 f"✅ Команда «{name}» создана!\n\n"
                 f"🎮 Используйте: @{BOT_NAME} {name}"
             )
+            user = await get_user(user_id)
             await message.answer(
-                "📋 Меню:",
+                get_main_menu_text(user['nickname'] if user else str(user_id)),
+                parse_mode="HTML",
                 reply_markup=get_main_keyboard(user_id)
             )
         else:
@@ -1421,7 +2212,7 @@ async def finish_create(message: types.Message, state: FSMContext):
 async def inline_query(query: types.InlineQuery):
     user_id = query.from_user.id
     user = await get_user(user_id)
-
+    
     raw_query = query.query.strip()
     query_text = raw_query.lower()
 
@@ -1708,9 +2499,6 @@ async def rp_button_press(callback: types.CallbackQuery):
         await callback.answer("❌ Команда не найдена!")
         return
     
-    if command.get('visibility') == 'private' and callback.from_user.id != command['creator_id']:
-        await callback.answer("🔒 Это приватная команда", show_alert=True)
-        return
     
     try:
         buttons = json.loads(command['buttons']) if command['buttons'] else []
@@ -1802,25 +2590,14 @@ async def menu_admin(callback: types.CallbackQuery):
         await callback.answer("❌ Нет доступа!")
         return
     
-    stats = await get_stats()
     report_count = await get_report_count()
     
-    builder = InlineKeyboardBuilder()
-    builder.button(text=f"📋 Жалобы ({report_count})", callback_data="admin_reports")
-    builder.button(text="🚫 Заблокированные", callback_data="admin_blocked")
-    builder.button(text="📊 Статистика", callback_data="admin_stats")
-    builder.button(text="◀️ Меню", callback_data="back_main")
-    builder.adjust(1)
-    
     await callback.message.edit_text(
-        f"👑 Админ панель\n\n"
-        f"👥 Пользователей: {stats['users']}\n"
-        f"🎯 Команд: {stats['commands']}\n"
-        f"🎯 Использований: {stats['total_uses']}\n"
-        f"❤️ Лайков: {stats['total_likes']}",
-        reply_markup=builder.as_markup()
+        "👑 Админ панель\n\nВыберите раздел:",
+        reply_markup=get_admin_main_keyboard(report_count)
     )
     await callback.answer()
+
 
 @dp.callback_query(F.data == "admin_reports")
 async def admin_reports(callback: types.CallbackQuery):
@@ -1833,11 +2610,33 @@ async def admin_reports_page(callback: types.CallbackQuery):
     await admin_reports_page_render(callback, page=page)
 
 
-async def admin_reports_page_render(callback: types.CallbackQuery, page: int = 0):
+@dp.callback_query(F.data.startswith("admin_reports_pick_"))
+async def admin_reports_pick(callback: types.CallbackQuery):
     if callback.from_user.id not in ADMIN_IDS:
         await callback.answer("❌ Нет доступа!")
         return
     
+    parts = callback.data.split("_")
+    current_page = int(parts[3]) if len(parts) > 3 else 0
+    total_pages = int(parts[4]) if len(parts) > 4 else 1
+
+    await callback.message.edit_text(
+        "📄 Выберите страницу жалоб:",
+        reply_markup=get_page_picker_keyboard(
+            base_callback="admin_reports_page",
+            current_page=current_page,
+            total_pages=total_pages,
+            back_callback=f"admin_reports_page_{current_page}"
+        )
+    )
+    await callback.answer()
+
+
+async def admin_reports_page_render(callback: types.CallbackQuery, page: int = 0):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("❌ Нет доступа!")
+        return
+
     per_page = 5
     total = await get_report_count()
 
@@ -1848,7 +2647,7 @@ async def admin_reports_page_render(callback: types.CallbackQuery, page: int = 0
         )
         await callback.answer()
         return
-    
+
     total_pages = (total + per_page - 1) // per_page
     if page < 0:
         page = 0
@@ -1893,15 +2692,27 @@ async def admin_report_view(callback: types.CallbackQuery):
     visibility_text = "🔒 Приватная" if report.get('command_visibility') == 'private' else "🌐 Публичная"
     active_text = "✅ Активна" if report.get('command_is_active') else "🗑️ Уже удалена"
 
+    command_full = await get_command(report['command_id'])
+    command_text_preview = html.escape((command_full or {}).get('text_before') or '-')
+    command_buttons_preview = "-"
+    if command_full and command_full.get('command_type') == 'target':
+        try:
+            btns = json.loads(command_full.get('buttons') or '[]')
+            command_buttons_preview = "\n".join([f"• {html.escape(b.get('name', ''))} → {html.escape(b.get('result', ''))}" for b in btns[:5]]) if btns else "(кнопок нет)"
+        except Exception:
+            command_buttons_preview = "(ошибка чтения кнопок)"
+
     text = (
         f"📄 <b>Жалоба #{report['id']}</b>\n\n"
         f"🎯 Команда: <b>{html.escape(report['command_name'])}</b>\n"
+        f"✍️ Текст команды: {command_text_preview}\n"
+        f"🔘 Кнопки:\n{command_buttons_preview}\n"
         f"👤 Автор команды: <b>{html.escape(report['creator_nickname'])}</b>\n"
         f"📝 Репорт от: <b>{html.escape(report['reporter_nickname'])}</b>\n"
         f"⚠️ Причина: <b>{html.escape(report['reason'])}</b>\n"
         f"📌 Видимость: {visibility_text}\n"
         f"📦 Статус команды: {active_text}\n"
-        f"🕒 Дата: {report['created_at']}"
+        f"🕒 Дата: {format_db_datetime(report.get('created_at'))}"
     )
 
     await callback.message.edit_text(
@@ -1931,21 +2742,16 @@ async def resolve_report_callback(callback: types.CallbackQuery):
     await callback.answer("✅ Жалоба обработана")
     await admin_reports_page_render(callback, page=0)
 
+
 @dp.callback_query(F.data.startswith("delete_cmd_"))
-async def delete_command_admin(callback: types.CallbackQuery):
+async def delete_command_admin_from_report(callback: types.CallbackQuery):
     if callback.from_user.id not in ADMIN_IDS:
         await callback.answer("❌ Нет доступа!")
         return
     
     command_id = int(callback.data.split("_")[-1])
     await delete_command(command_id)
-
-    async with aiosqlite.connect(DATABASE_PATH) as db:
-        await db.execute(
-            "UPDATE reports SET status = 'approved' WHERE command_id = ? AND status = 'pending'",
-            (command_id,)
-        )
-        await db.commit()
+    await resolve_pending_reports_for_command(command_id, status="approved")
 
     await callback.answer("✅ Команда удалена")
     await admin_reports_page_render(callback, page=0)
@@ -1967,55 +2773,1267 @@ async def admin_block_from_report(callback: types.CallbackQuery):
     await callback.answer("🚫 Автор заблокирован")
     await admin_reports_page_render(callback, page=0)
 
+
+@dp.callback_query(F.data == "admin_users")
+async def admin_users(callback: types.CallbackQuery):
+    await admin_users_page_render(callback, page=0, status_filter="all", sort_by="use")
+
+
+@dp.callback_query(F.data.startswith("admin_users_filter_menu_"))
+async def admin_users_filter_menu(callback: types.CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("❌ Нет доступа!")
+        return
+
+    parts = callback.data.split("_")
+    current_status = parts[4] if len(parts) > 4 else "all"
+    current_sort = parts[5] if len(parts) > 5 else "use"
+
+    await callback.message.edit_text(
+        "👥 Фильтр пользователей по статусу:",
+        reply_markup=get_admin_users_filter_menu_keyboard(current_status=current_status, current_sort=current_sort)
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("admin_users_sort_menu_"))
+async def admin_users_sort_menu(callback: types.CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("❌ Нет доступа!")
+        return
+
+    parts = callback.data.split("_")
+    current_status = parts[4] if len(parts) > 4 else "all"
+    current_sort = parts[5] if len(parts) > 5 else "use"
+
+    await callback.message.edit_text(
+        "↕️ Сортировка пользователей:",
+        reply_markup=get_admin_users_sort_menu_keyboard(current_status=current_status, current_sort=current_sort)
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("admin_users_apply_status_"))
+async def admin_users_apply_status(callback: types.CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("❌ Нет доступа!")
+        return
+
+    parts = callback.data.split("_")
+    status_filter = parts[4] if len(parts) > 4 else "all"
+    sort_by = parts[5] if len(parts) > 5 else "use"
+    await admin_users_page_render(callback, page=0, status_filter=status_filter, sort_by=sort_by)
+
+
+@dp.callback_query(F.data.startswith("admin_users_apply_sort_"))
+async def admin_users_apply_sort(callback: types.CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("❌ Нет доступа!")
+        return
+
+    parts = callback.data.split("_")
+    sort_by = parts[4] if len(parts) > 4 else "use"
+    status_filter = parts[5] if len(parts) > 5 else "all"
+    await admin_users_page_render(callback, page=0, status_filter=status_filter, sort_by=sort_by)
+
+
+@dp.callback_query(F.data.startswith("admin_users_page_"))
+async def admin_users_page(callback: types.CallbackQuery):
+    parts = callback.data.split("_")
+    status_filter = parts[3] if len(parts) > 3 else "all"
+    sort_by = parts[4] if len(parts) > 4 else "use"
+    page = int(parts[5]) if len(parts) > 5 else 0
+    await admin_users_page_render(callback, page=page, status_filter=status_filter, sort_by=sort_by)
+
+
+@dp.callback_query(F.data.startswith("admin_users_pick_"))
+async def admin_users_pick(callback: types.CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("❌ Нет доступа!")
+        return
+
+    parts = callback.data.split("_")
+    status_filter = parts[3] if len(parts) > 3 else "all"
+    sort_by = parts[4] if len(parts) > 4 else "use"
+    current_page = int(parts[5]) if len(parts) > 5 else 0
+    total_pages = int(parts[6]) if len(parts) > 6 else 1
+
+    await callback.message.edit_text(
+        "📄 Выберите страницу пользователей:",
+        reply_markup=get_page_picker_keyboard(
+            base_callback=f"admin_users_page_{status_filter}_{sort_by}",
+            current_page=current_page,
+            total_pages=total_pages,
+            back_callback=f"admin_users_page_{status_filter}_{sort_by}_{current_page}"
+        )
+    )
+    await callback.answer()
+
+
+async def admin_users_page_render(callback: types.CallbackQuery, page: int = 0, status_filter: str = "all", sort_by: str = "use"):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("❌ Нет доступа!")
+        return
+
+    per_page = 8
+    total = await get_users_count(status_filter=status_filter)
+
+    if total == 0:
+        await callback.message.edit_text(
+            "👥 Пользователи\n\nСписок пуст по выбранному фильтру.",
+            reply_markup=get_back_keyboard("menu_admin")
+        )
+        await callback.answer()
+        return
+
+    total_pages = (total + per_page - 1) // per_page
+    page = max(0, min(page, total_pages - 1))
+
+    users = await get_admin_users_page(page=page, per_page=per_page, status_filter=status_filter, sort_by=sort_by)
+
+    await callback.message.edit_text(
+        f"👥 Пользователи\n\nВсего: {total}\nВыберите пользователя:",
+        reply_markup=get_admin_users_keyboard(users, page=page, total_pages=total_pages, status_filter=status_filter, sort_by=sort_by)
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("admin_user_") & ~F.data.startswith("admin_user_cmds_") & ~F.data.startswith("admin_user_cmd_"))
+async def admin_user_profile(callback: types.CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("❌ Нет доступа!")
+        return
+
+    user_id = int(callback.data.split("_")[-1])
+    profile = await get_admin_user_profile(user_id)
+
+    if not profile:
+        await callback.answer("❌ Пользователь не найден", show_alert=True)
+        return
+
+    status_text = "🚫 Заблокирован" if profile.get('is_blocked') else "✅ Активен"
+    block_info = ""
+    if profile.get('is_blocked'):
+        block_info = (
+            f"\n⛔ Причина блока: {html.escape(profile.get('block_reason') or 'Не указана')}"
+            f"\n🕒 Блок с: {format_db_datetime(profile.get('blocked_at'))}"
+        )
+
+    text = (
+        f"👤 <b>Профиль пользователя</b>\n\n"
+        f"ID: <code>{profile['user_id']}</code>\n"
+        f"Ник: <b>{html.escape(profile['nickname'])}</b>\n"
+        f"Статус: {status_text}\n"
+        f"Регистрация: {format_db_datetime(profile.get('created_at'))}\n\n"
+        f"🎯 Команд всего: <b>{profile['commands_total']}</b>\n"
+        f"✅ Активных: <b>{profile['commands_active']}</b>\n"
+        f"🗑️ Неактивных: <b>{profile['commands_inactive']}</b>\n"
+        f"🌐 Публичных: <b>{profile['commands_public']}</b>\n"
+        f"🔒 Приватных: <b>{profile['commands_private']}</b>\n"
+        f"📊 Использований: <b>{profile['total_uses']}</b>\n"
+        f"❤️ Лайков: <b>{profile['total_likes']}</b>"
+        f"{block_info}"
+    )
+
+    await callback.message.edit_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=get_admin_user_profile_keyboard(user_id=user_id, is_blocked=bool(profile.get('is_blocked')))
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("admin_user_cmds_") & ~F.data.startswith("admin_user_cmds_page_"))
+async def admin_user_commands(callback: types.CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("❌ Нет доступа!")
+        return
+
+    user_id = int(callback.data.split("_")[-1])
+    await admin_user_commands_page_render(callback, user_id=user_id, page=0)
+
+
+@dp.callback_query(F.data.startswith("admin_user_cmds_page_"))
+async def admin_user_commands_page(callback: types.CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("❌ Нет доступа!")
+        return
+
+    parts = callback.data.split("_")
+    user_id = int(parts[4])
+    page = int(parts[5])
+    await admin_user_commands_page_render(callback, user_id=user_id, page=page)
+
+
+@dp.callback_query(F.data.startswith("admin_user_cmds_pick_"))
+async def admin_user_commands_pick(callback: types.CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("❌ Нет доступа!")
+        return
+
+    parts = callback.data.split("_")
+    user_id = int(parts[4]) if len(parts) > 4 else 0
+    current_page = int(parts[5]) if len(parts) > 5 else 0
+    total_pages = int(parts[6]) if len(parts) > 6 else 1
+
+    await callback.message.edit_text(
+        "📄 Выберите страницу команд пользователя:",
+        reply_markup=get_page_picker_keyboard(
+            base_callback=f"admin_user_cmds_page_{user_id}",
+            current_page=current_page,
+            total_pages=total_pages,
+            back_callback=f"admin_user_cmds_page_{user_id}_{current_page}"
+        )
+    )
+    await callback.answer()
+
+
+async def admin_user_commands_page_render(callback: types.CallbackQuery, user_id: int, page: int = 0):
+    per_page = 6
+    total = await get_admin_user_commands_count(user_id)
+    user = await get_user(user_id)
+
+    if not user:
+        await callback.answer("❌ Пользователь не найден", show_alert=True)
+        return
+
+    if total == 0:
+        await callback.message.edit_text(
+            f"🎯 Команды пользователя <b>{html.escape(user['nickname'])}</b>\n\n"
+            f"Команд пока нет.",
+            parse_mode="HTML",
+            reply_markup=get_back_keyboard(f"admin_user_{user_id}")
+        )
+        await callback.answer()
+        return
+
+    total_pages = (total + per_page - 1) // per_page
+    page = max(0, min(page, total_pages - 1))
+    commands = await get_admin_user_commands(user_id=user_id, page=page, per_page=per_page)
+
+    await callback.message.edit_text(
+        f"🎯 Команды пользователя <b>{html.escape(user['nickname'])}</b>\n\n"
+        f"Всего: {total}",
+        parse_mode="HTML",
+        reply_markup=get_admin_user_commands_keyboard(commands, user_id=user_id, page=page, total_pages=total_pages)
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("admin_user_cmd_"))
+async def admin_user_command_open(callback: types.CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("❌ Нет доступа!")
+        return
+
+    parts = callback.data.split("_")
+    command_id = int(parts[3])
+    user_id = int(parts[4])
+    await admin_command_view_render(callback, command_id=command_id, back_callback=f"admin_user_cmds_{user_id}")
+
+
+@dp.callback_query(F.data == "admin_commands")
+async def admin_commands(callback: types.CallbackQuery):
+    await admin_commands_page_render(callback, page=0, status_filter="all", visibility_filter="all", sort_by="new")
+
+
+@dp.callback_query(F.data.startswith("admin_commands_filter_status_menu_"))
+async def admin_commands_filter_status_menu(callback: types.CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("❌ Нет доступа!")
+        return
+
+    parts = callback.data.split("_")
+    status_filter = parts[5] if len(parts) > 5 else "all"
+    visibility_filter = parts[6] if len(parts) > 6 else "all"
+    sort_by = parts[7] if len(parts) > 7 else "new"
+
+    await callback.message.edit_text(
+        "📦 Фильтр команд по статусу:",
+        reply_markup=get_admin_commands_status_filter_menu_keyboard(
+            current_status=status_filter,
+            current_visibility=visibility_filter,
+            current_sort=sort_by
+        )
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("admin_commands_filter_visibility_menu_"))
+async def admin_commands_filter_visibility_menu(callback: types.CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("❌ Нет доступа!")
+        return
+
+    parts = callback.data.split("_")
+    status_filter = parts[5] if len(parts) > 5 else "all"
+    visibility_filter = parts[6] if len(parts) > 6 else "all"
+    sort_by = parts[7] if len(parts) > 7 else "new"
+
+    await callback.message.edit_text(
+        "👁️ Фильтр команд по видимости:",
+        reply_markup=get_admin_commands_visibility_filter_menu_keyboard(
+            current_status=status_filter,
+            current_visibility=visibility_filter,
+            current_sort=sort_by
+        )
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("admin_commands_sort_menu_"))
+async def admin_commands_sort_menu(callback: types.CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("❌ Нет доступа!")
+        return
+
+    parts = callback.data.split("_")
+    status_filter = parts[4] if len(parts) > 4 else "all"
+    visibility_filter = parts[5] if len(parts) > 5 else "all"
+    sort_by = parts[6] if len(parts) > 6 else "new"
+
+    await callback.message.edit_text(
+        "↕️ Сортировка команд:",
+        reply_markup=get_admin_commands_sort_menu_keyboard(
+            current_status=status_filter,
+            current_visibility=visibility_filter,
+            current_sort=sort_by
+        )
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("admin_commands_apply_status_"))
+async def admin_commands_apply_status(callback: types.CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("❌ Нет доступа!")
+        return
+
+    parts = callback.data.split("_")
+    status_filter = parts[4] if len(parts) > 4 else "all"
+    visibility_filter = parts[5] if len(parts) > 5 else "all"
+    sort_by = parts[6] if len(parts) > 6 else "new"
+
+    await admin_commands_page_render(
+        callback,
+        page=0,
+        status_filter=status_filter,
+        visibility_filter=visibility_filter,
+        sort_by=sort_by
+    )
+
+
+@dp.callback_query(F.data.startswith("admin_commands_apply_visibility_"))
+async def admin_commands_apply_visibility(callback: types.CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("❌ Нет доступа!")
+        return
+
+    parts = callback.data.split("_")
+    visibility_filter = parts[4] if len(parts) > 4 else "all"
+    status_filter = parts[5] if len(parts) > 5 else "all"
+    sort_by = parts[6] if len(parts) > 6 else "new"
+
+    await admin_commands_page_render(
+        callback,
+        page=0,
+        status_filter=status_filter,
+        visibility_filter=visibility_filter,
+        sort_by=sort_by
+    )
+
+
+@dp.callback_query(F.data.startswith("admin_commands_apply_sort_"))
+async def admin_commands_apply_sort(callback: types.CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("❌ Нет доступа!")
+        return
+
+    parts = callback.data.split("_")
+    sort_by = parts[4] if len(parts) > 4 else "new"
+    status_filter = parts[5] if len(parts) > 5 else "all"
+    visibility_filter = parts[6] if len(parts) > 6 else "all"
+
+    await admin_commands_page_render(
+        callback,
+        page=0,
+        status_filter=status_filter,
+        visibility_filter=visibility_filter,
+        sort_by=sort_by
+    )
+
+
+@dp.callback_query(F.data.startswith("admin_commands_page_"))
+async def admin_commands_page(callback: types.CallbackQuery):
+    parts = callback.data.split("_")
+    status_filter = parts[3] if len(parts) > 3 else "all"
+    visibility_filter = parts[4] if len(parts) > 4 else "all"
+    sort_by = parts[5] if len(parts) > 5 else "new"
+    page = int(parts[6]) if len(parts) > 6 else 0
+    await admin_commands_page_render(
+        callback,
+        page=page,
+        status_filter=status_filter,
+        visibility_filter=visibility_filter,
+        sort_by=sort_by
+    )
+
+
+@dp.callback_query(F.data.startswith("admin_commands_pick_"))
+async def admin_commands_pick(callback: types.CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("❌ Нет доступа!")
+        return
+
+    parts = callback.data.split("_")
+    status_filter = parts[3] if len(parts) > 3 else "all"
+    visibility_filter = parts[4] if len(parts) > 4 else "all"
+    sort_by = parts[5] if len(parts) > 5 else "new"
+    current_page = int(parts[6]) if len(parts) > 6 else 0
+    total_pages = int(parts[7]) if len(parts) > 7 else 1
+
+    await callback.message.edit_text(
+        "📄 Выберите страницу команд:",
+        reply_markup=get_page_picker_keyboard(
+            base_callback=f"admin_commands_page_{status_filter}_{visibility_filter}_{sort_by}",
+            current_page=current_page,
+            total_pages=total_pages,
+            back_callback=f"admin_commands_page_{status_filter}_{visibility_filter}_{sort_by}_{current_page}"
+        )
+    )
+    await callback.answer()
+
+
+async def admin_commands_page_render(callback: types.CallbackQuery, page: int = 0, status_filter: str = "all", visibility_filter: str = "all", sort_by: str = "new"):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("❌ Нет доступа!")
+        return
+
+    per_page = 8
+    total = await get_admin_commands_count(status_filter=status_filter, visibility_filter=visibility_filter)
+
+    if total == 0:
+        await callback.message.edit_text(
+            "🎯 Команды\n\nСписок пуст по выбранным фильтрам.",
+            reply_markup=get_back_keyboard("menu_admin")
+        )
+        await callback.answer()
+        return
+
+    total_pages = (total + per_page - 1) // per_page
+    page = max(0, min(page, total_pages - 1))
+    commands = await get_admin_commands_page(
+        page=page,
+        per_page=per_page,
+        status_filter=status_filter,
+        visibility_filter=visibility_filter,
+        sort_by=sort_by
+    )
+
+    await callback.message.edit_text(
+        f"🎯 Команды\n\nВсего: {total}\nВыберите команду:",
+        reply_markup=get_admin_commands_keyboard(
+            commands,
+            page=page,
+            total_pages=total_pages,
+            status_filter=status_filter,
+            visibility_filter=visibility_filter,
+            sort_by=sort_by
+        )
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("admin_cmd_"))
+async def admin_command_view(callback: types.CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("❌ Нет доступа!")
+        return
+
+    command_id = int(callback.data.split("_")[-1])
+    await admin_command_view_render(callback, command_id=command_id, back_callback="admin_commands")
+
+
+async def admin_command_view_render(callback: types.CallbackQuery, command_id: int, back_callback: str = "admin_commands"):
+    command = await get_command(command_id)
+    if not command:
+        await callback.answer("❌ Команда не найдена", show_alert=True)
+        return
+
+    type_text = "👤 Для себя" if command['command_type'] == 'self' else "👥 Для другого"
+    visibility_text = "🔒 Приватная" if command.get('visibility') == 'private' else "🌐 Публичная"
+    status_text = "✅ Активна" if command.get('is_active') else "🗑️ Удалена"
+
+    created_human = format_db_datetime(command.get('created_at'))
+
+    buttons_preview = "-"
+    if command['command_type'] == 'target':
+        try:
+            btns = json.loads(command.get('buttons') or '[]')
+            if btns:
+                buttons_preview = "\n".join([f"• {html.escape(b.get('name', ''))} → {html.escape(b.get('result', ''))}" for b in btns[:5]])
+            else:
+                buttons_preview = "(кнопок нет)"
+        except Exception:
+            buttons_preview = "(ошибка чтения кнопок)"
+
+    text = (
+        f"🎯 <b>Команда #{command['id']}</b>\n\n"
+        f"Название: <b>{html.escape(command['name'])}</b>\n"
+        f"Описание: {html.escape(command['description'] or 'Без описания')}\n"
+        f"Тип: {type_text}\n"
+        f"Видимость: {visibility_text}\n"
+        f"Статус: {status_text}\n"
+        f"Текст: {html.escape(command.get('text_before') or '-')}\n"
+        f"Кнопки:\n{buttons_preview}\n"
+        f"Автор: <b>{html.escape(command['creator_nickname'])}</b> (<code>{command['creator_id']}</code>)\n"
+        f"Public ID: <code>{command.get('public_id') or '-'}</code>\n"
+        f"Использований: <b>{command['uses']}</b>\n"
+        f"Лайков: <b>{command['likes']}</b>\n"
+        f"Создана: {created_human}"
+    )
+
+    kb = get_admin_command_actions_keyboard(
+        command_id=command['id'],
+        creator_id=command['creator_id'],
+        is_active=bool(command.get('is_active', 1)),
+        back_callback=back_callback
+    )
+
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("admin_delete_cmd_"))
+async def admin_delete_command(callback: types.CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("❌ Нет доступа!")
+        return
+
+    command_id = int(callback.data.split("_")[-1])
+    command = await get_command(command_id)
+    await delete_command(command_id)
+    await resolve_pending_reports_for_command(command_id, status="approved")
+
+    await callback.answer("✅ Команда деактивирована")
+    back_cb = f"admin_user_cmds_{command['creator_id']}" if command else "admin_commands"
+    await admin_command_view_render(callback, command_id=command_id, back_callback=back_cb)
+
+
+@dp.callback_query(F.data.startswith("admin_restore_cmd_"))
+async def admin_restore_command(callback: types.CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("❌ Нет доступа!")
+        return
+
+    command_id = int(callback.data.split("_")[-1])
+    command = await get_command(command_id)
+    await restore_command(command_id)
+
+    await callback.answer("♻️ Команда восстановлена")
+    back_cb = f"admin_user_cmds_{command['creator_id']}" if command else "admin_commands"
+    await admin_command_view_render(callback, command_id=command_id, back_callback=back_cb)
+
+
+@dp.callback_query(F.data.startswith("admin_block_user_"))
+async def admin_block_user_direct(callback: types.CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("❌ Нет доступа!")
+        return
+
+    target_id = int(callback.data.split("_")[-1])
+    await block_user(target_id, callback.from_user.id, reason="Manual admin block")
+    await callback.answer("🚫 Пользователь заблокирован")
+    await admin_user_profile(callback)
+
+
+@dp.callback_query(F.data.startswith("admin_unblock_user_"))
+async def admin_unblock_user_direct(callback: types.CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("❌ Нет доступа!")
+        return
+
+    target_id = int(callback.data.split("_")[-1])
+    await unblock_user(target_id)
+    await callback.answer("✅ Пользователь разблокирован")
+    await admin_user_profile(callback)
+
+
 @dp.callback_query(F.data == "admin_blocked")
 async def admin_blocked(callback: types.CallbackQuery):
     if callback.from_user.id not in ADMIN_IDS:
         await callback.answer("❌ Нет доступа!")
         return
-    
+
     blocked = await get_blocked_users(20)
-    
+
     if not blocked:
         await callback.message.edit_text("✅ Нет заблокированных", reply_markup=get_back_keyboard("menu_admin"))
         await callback.answer()
         return
-    
+
     builder = InlineKeyboardBuilder()
     for user in blocked:
-        builder.button(text=f"🔓 {user['nickname']}", callback_data=f"unblock_{user['user_id']}")
-    
+        builder.button(text=f"🔓 {user['nickname']}", callback_data=f"admin_unblock_user_{user['user_id']}")
+
     builder.adjust(1)
     builder.button(text="◀️ Назад", callback_data="menu_admin")
-    
+
     await callback.message.edit_text("🚫 Заблокированные:", reply_markup=builder.as_markup())
     await callback.answer()
 
-@dp.callback_query(F.data.startswith("unblock_"))
-async def unblock_user_callback(callback: types.CallbackQuery):
-    if callback.from_user.id not in ADMIN_IDS:
-        await callback.answer("❌ Нет доступа!")
-        return
-    
-    target_id = int(callback.data.split("_")[-1])
-    await unblock_user(target_id)
-    await callback.answer("✅ Разблокирован!")
-    await admin_blocked(callback)
+
+async def get_admin_stats_selection(state: FSMContext) -> tuple[str | None, str | None, str | None, str | None]:
+    data = await state.get_data()
+    return (
+        data.get("admin_stats_filter_type"),  # "day" или "range"
+        data.get("admin_stats_selected_day"),
+        data.get("admin_stats_selected_from"),
+        data.get("admin_stats_selected_to")
+    )
+
+
+async def set_admin_stats_day_filter(state: FSMContext, date_text: str):
+    await state.update_data(
+        admin_stats_filter_type="day",
+        admin_stats_selected_day=date_text,
+        admin_stats_selected_from=None,
+        admin_stats_selected_to=None
+    )
+
+
+async def set_admin_stats_range_filter(state: FSMContext, date_from: str, date_to: str):
+    await state.update_data(
+        admin_stats_filter_type="range",
+        admin_stats_selected_day=None,
+        admin_stats_selected_from=date_from,
+        admin_stats_selected_to=date_to
+    )
+
+
+async def reset_admin_stats_filter(state: FSMContext):
+    await state.update_data(
+        admin_stats_filter_type=None,
+        admin_stats_selected_day=None,
+        admin_stats_selected_from=None,
+        admin_stats_selected_to=None
+    )
+
 
 @dp.callback_query(F.data == "admin_stats")
-async def admin_stats(callback: types.CallbackQuery):
+async def admin_stats(callback: types.CallbackQuery, state: FSMContext):
+    period = (await state.get_data()).get("admin_stats_period", "all")
+
+    filter_type, selected_day, selected_from, selected_to = await get_admin_stats_selection(state)
+    if filter_type == "day" and selected_day:
+        stats = await get_stats_by_date_range(selected_day, selected_day)
+        await safe_edit_message(
+            callback,
+            f"📊 <b>Статистика за {format_human_date_with_weekday(selected_day)}</b>\n"
+            f"<i>{format_human_date_full_ru(selected_day)}</i>\n\n"
+            f"👥 Новых пользователей: <b>{stats['users']}</b>\n"
+            f"🎯 Создано команд: <b>{stats['commands']}</b>\n"
+            f"🔥 Использований (по созданным в дне): <b>{stats['total_uses']}</b>\n"
+            f"❤️ Лайков (по созданным в дне): <b>{stats['total_likes']}</b>\n"
+            f"🚩 Жалоб создано: <b>{stats['reports']}</b>\n\n"
+            f"📦 Активных команд (текущее): <b>{stats['active_commands_total']}</b>\n"
+            f"🚫 Заблокированных пользователей (текущее): <b>{stats['blocked_users_total']}</b>",
+            parse_mode="HTML",
+            reply_markup=get_admin_stats_keyboard(period, filter_type="day", selected_day=selected_day)
+        )
+        await callback.answer()
+        return
+
+    if filter_type == "range" and selected_from and selected_to:
+        stats = await get_stats_by_date_range(selected_from, selected_to)
+        await safe_edit_message(
+            callback,
+            f"📊 <b>Статистика за период</b>\n"
+            f"• От: <b>{format_human_date_with_weekday(selected_from)}</b>\n"
+            f"• До: <b>{format_human_date_with_weekday(selected_to)}</b>\n"
+            f"<i>{format_human_date_full_ru(selected_from)} → {format_human_date_full_ru(selected_to)}</i>\n\n"
+            f"👥 Новых пользователей: <b>{stats['users']}</b>\n"
+            f"🎯 Создано команд: <b>{stats['commands']}</b>\n"
+            f"🔥 Использований (по созданным в периоде): <b>{stats['total_uses']}</b>\n"
+            f"❤️ Лайков (по созданным в периоде): <b>{stats['total_likes']}</b>\n"
+            f"🚩 Жалоб создано: <b>{stats['reports']}</b>\n\n"
+            f"📦 Активных команд (текущее): <b>{stats['active_commands_total']}</b>\n"
+            f"🚫 Заблокированных пользователей (текущее): <b>{stats['blocked_users_total']}</b>",
+            parse_mode="HTML",
+            reply_markup=get_admin_stats_keyboard(period, filter_type="range", selected_from=selected_from, selected_to=selected_to)
+        )
+        await callback.answer()
+        return
+
+    await admin_stats_render(callback, state=state, period=period)
+
+
+@dp.callback_query(F.data == "admin_stats_period_menu")
+async def admin_stats_period_menu(callback: types.CallbackQuery):
     if callback.from_user.id not in ADMIN_IDS:
         await callback.answer("❌ Нет доступа!")
         return
+
+    builder = InlineKeyboardBuilder()
+    builder.button(text="📅 Сегодня", callback_data="admin_stats_today")
+    builder.button(text="🗓️ 7 дней", callback_data="admin_stats_week")
+    builder.button(text="🗓️ Месяц", callback_data="admin_stats_month")
+    builder.button(text="♾️ Всё время", callback_data="admin_stats_all")
+    builder.button(text="◀️ Назад", callback_data="admin_stats")
+    builder.adjust(1)
+
+    await safe_edit_message(
+        callback,
+        "📊 Выберите период статистики:",
+        reply_markup=builder.as_markup()
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "admin_stats_reset_dates")
+async def admin_stats_reset_dates(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("❌ Нет доступа!")
+        return
+
+    await reset_admin_stats_filter(state)
+    await admin_stats(callback, state)
+    await callback.answer("✅ Фильтр сброшен")
+
+
+@dp.callback_query(F.data == "admin_stats_cal_day_now")
+async def admin_stats_calendar_day_now(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("❌ Нет доступа!")
+        return
+
+    filter_type, selected_day, selected_from, selected_to = await get_admin_stats_selection(state)
+    now = datetime.now().astimezone()
+    year = now.year
+    month = now.month
+
+    cal_from = selected_day
+    cal_to = None
+    if filter_type == "range" and selected_from and selected_to:
+        cal_from = selected_from
+        cal_to = selected_to
+
+    if cal_from:
+        y, m, _ = cal_from.split("-")
+        year = int(y)
+        month = int(m)
+
+    await state.update_data(admin_stats_cal_mode="day")
+    await safe_edit_message(
+        callback,
+        "📅 Выберите день:",
+        reply_markup=get_stats_calendar_keyboard("day", year, month, selected_from=cal_from, selected_to=cal_to, back_callback="admin_stats")
+    )
+    await callback.answer()
+
+
+
+@dp.callback_query(F.data.startswith("admin_stats_cal_day_sel_"))
+async def admin_stats_calendar_day_selected(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("❌ Нет доступа!")
+        return
+
+    selected_day = callback.data.removeprefix("admin_stats_cal_day_sel_")
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", selected_day):
+        await callback.answer("❌ Неверная дата", show_alert=True)
+        return
+
+    filter_type, _, selected_from, selected_to = await get_admin_stats_selection(state)
+    cal_from = selected_day
+    cal_to = None
+    if filter_type == "range" and selected_from and selected_to:
+        cal_from = selected_from
+        cal_to = selected_to
+
+    year, month, _ = cal_from.split("-")
+    await state.update_data(admin_stats_cal_mode="day")
+    await safe_edit_message(
+        callback,
+        "📅 Выберите день:",
+        reply_markup=get_stats_calendar_keyboard("day", int(year), int(month), selected_from=cal_from, selected_to=cal_to, back_callback="admin_stats")
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "noop")
+async def noop_callback(callback: types.CallbackQuery):
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("admin_stats_cal_day_"))
+async def admin_stats_calendar_day_month(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("❌ Нет доступа!")
+        return
+
+    parts = callback.data.split("_")
+    if len(parts) < 6 or not parts[4].isdigit() or not parts[5].isdigit():
+        await callback.answer()
+        return
+
+    year = int(parts[4])
+    month = int(parts[5])
+    filter_type, selected_day, selected_from, selected_to = await get_admin_stats_selection(state)
+
+    cal_from = selected_day
+    cal_to = None
+    if filter_type == "range" and selected_from and selected_to:
+        cal_from = selected_from
+        cal_to = selected_to
+
+    await safe_edit_message(
+        callback,
+        "📅 Выберите день:",
+        reply_markup=get_stats_calendar_keyboard("day", year, month, selected_from=cal_from, selected_to=cal_to, back_callback="admin_stats")
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("admin_stats_day_"))
+async def admin_stats_calendar_day_select(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("❌ Нет доступа!")
+        return
+
+    date_text = callback.data.removeprefix("admin_stats_day_")
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_text):
+        await callback.answer("❌ Неверная дата", show_alert=True)
+        return
+
+    await set_admin_stats_day_filter(state, date_text)
+    stats = await get_stats_by_date_range(date_text, date_text)
+
+    await safe_edit_message(
+        callback,
+        f"📊 <b>Статистика за {format_human_date_with_weekday(date_text)}</b>\n"
+        f"<i>{format_human_date_full_ru(date_text)}</i>\n\n"
+        f"👥 Новых пользователей: <b>{stats['users']}</b>\n"
+        f"🎯 Создано команд: <b>{stats['commands']}</b>\n"
+        f"🔥 Использований (по созданным в дне): <b>{stats['total_uses']}</b>\n"
+        f"❤️ Лайков (по созданным в дне): <b>{stats['total_likes']}</b>\n"
+        f"🚩 Жалоб создано: <b>{stats['reports']}</b>\n\n"
+        f"📦 Активных команд (текущее): <b>{stats['active_commands_total']}</b>\n"
+        f"🚫 Заблокированных пользователей (текущее): <b>{stats['blocked_users_total']}</b>",
+        parse_mode="HTML",
+        reply_markup=get_admin_stats_keyboard("all", filter_type="day", selected_day=date_text)
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "admin_stats_cal_range_from_now")
+async def admin_stats_calendar_range_from_now(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("❌ Нет доступа!")
+        return
+
+    filter_type, selected_day, selected_from, selected_to = await get_admin_stats_selection(state)
+    now = datetime.now().astimezone()
+    year = now.year
+    month = now.month
+
+    cal_from = selected_from
+    cal_to = selected_to
+    if filter_type == "day" and selected_day:
+        cal_from = selected_day
+        cal_to = selected_day
+
+    if cal_from:
+        y, m, _ = cal_from.split("-")
+        year = int(y)
+        month = int(m)
+
+    await state.update_data(admin_stats_cal_mode="range_from")
+    await safe_edit_message(
+        callback,
+        "📆 Выберите начальную дату диапазона:",
+        reply_markup=get_stats_calendar_keyboard("range_from", year, month, selected_from=cal_from, selected_to=cal_to, back_callback="admin_stats")
+    )
+    await callback.answer()
+
+
+
+@dp.callback_query(F.data.startswith("admin_stats_cal_range_from_sel_"))
+async def admin_stats_calendar_range_from_selected(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("❌ Нет доступа!")
+        return
+
+    selected_from = callback.data.removeprefix("admin_stats_cal_range_from_sel_")
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", selected_from):
+        await callback.answer("❌ Неверная дата", show_alert=True)
+        return
+
+    filter_type, selected_day, _, selected_to = await get_admin_stats_selection(state)
+    cal_from = selected_from
+    cal_to = selected_to
+    if filter_type == "day" and selected_day:
+        cal_from = selected_day
+        cal_to = selected_day
+
+    year, month, _ = cal_from.split("-")
+    await state.update_data(admin_stats_cal_mode="range_from")
+    await safe_edit_message(
+        callback,
+        "📆 Выберите начальную дату диапазона:",
+        reply_markup=get_stats_calendar_keyboard("range_from", int(year), int(month), selected_from=cal_from, selected_to=cal_to, back_callback="admin_stats")
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("admin_stats_cal_range_from_"))
+async def admin_stats_calendar_range_from_month(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("❌ Нет доступа!")
+        return
+
+    parts = callback.data.split("_")
+    if len(parts) < 7 or not parts[5].isdigit() or not parts[6].isdigit():
+        await callback.answer()
+        return
+
+    year = int(parts[5])
+    month = int(parts[6])
+
+    filter_type, selected_day, selected_from, selected_to = await get_admin_stats_selection(state)
+    cal_from = selected_from
+    cal_to = selected_to
+    if filter_type == "day" and selected_day:
+        cal_from = selected_day
+        cal_to = selected_day
+
+    await state.update_data(admin_stats_cal_mode="range_from")
+    await safe_edit_message(
+        callback,
+        "📆 Выберите начальную дату диапазона:",
+        reply_markup=get_stats_calendar_keyboard("range_from", year, month, selected_from=cal_from, selected_to=cal_to, back_callback="admin_stats")
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("admin_stats_range_from_"))
+async def admin_stats_calendar_range_from_select(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("❌ Нет доступа!")
+        return
+
+    date_from = callback.data.removeprefix("admin_stats_range_from_")
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_from):
+        await callback.answer("❌ Неверная дата", show_alert=True)
+        return
+
+    _, _, _, selected_to = await get_admin_stats_selection(state)
+    await state.update_data(admin_stats_selected_from=date_from)
+    year, month, _ = date_from.split("-")
+
+    await state.update_data(admin_stats_cal_mode="range_to")
+    await safe_edit_message(
+        callback,
+        f"📆 Начало периода: <b>{format_human_date_with_weekday(date_from)}</b>\n"
+        f"<i>{format_human_date_full_ru(date_from)}</i>\n\n"
+        f"Выберите конечную дату:",
+        parse_mode="HTML",
+        reply_markup=get_stats_calendar_keyboard(
+            "range_to", int(year), int(month),
+            selected_from=date_from,
+            selected_to=selected_to,
+            back_callback="admin_stats"
+        )
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("admin_stats_cal_range_to_from_"))
+async def admin_stats_calendar_range_to_from(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("❌ Нет доступа!")
+        return
+
+    selected_from = callback.data.removeprefix("admin_stats_cal_range_to_from_")
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", selected_from):
+        await callback.answer("❌ Неверная дата", show_alert=True)
+        return
+
+    _, _, _, selected_to = await get_admin_stats_selection(state)
+    year, month, _ = selected_from.split("-")
     
-    stats = await get_stats()
+    await state.update_data(admin_stats_cal_mode="range_to")
+    await safe_edit_message(
+        callback,
+        f"📆 Начало периода: <b>{format_human_date_with_weekday(selected_from)}</b>\n"
+        f"<i>{format_human_date_full_ru(selected_from)}</i>\n\n"
+        f"Выберите конечную дату:",
+        parse_mode="HTML",
+        reply_markup=get_stats_calendar_keyboard(
+            "range_to", int(year), int(month),
+            selected_from=selected_from,
+            selected_to=selected_to,
+            back_callback="admin_stats"
+        )
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "admin_stats_cal_range_to_open")
+async def admin_stats_calendar_range_to_open(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("❌ Нет доступа!")
+        return
+
+    _, _, selected_from, _ = await get_admin_stats_selection(state)
+    now = datetime.now().astimezone()
     
-    await callback.message.edit_text(
-        f"📊 Статистика\n\n"
-        f"👥 Пользователей: {stats['users']}\n"
-        f"🎯 Команд: {stats['commands']}\n"
-        f"🎯 Использований: {stats['total_uses']}\n"
-        f"❤️ Лайков: {stats['total_likes']}",
-        reply_markup=get_back_keyboard("menu_admin")
+    if not selected_from:
+        await callback.answer("❌ Сначала выберите дату «От»", show_alert=True)
+        return
+
+    year, month, _ = selected_from.split("-")
+    await state.update_data(admin_stats_cal_mode="range_to")
+    await safe_edit_message(
+        callback,
+        f"📆 Начало периода: <b>{format_human_date_with_weekday(selected_from)}</b>\n"
+        f"<i>{format_human_date_full_ru(selected_from)}</i>\n\n"
+        f"Выберите конечную дату:",
+        parse_mode="HTML",
+        reply_markup=get_stats_calendar_keyboard(
+            "range_to", int(year), int(month),
+            selected_from=selected_from,
+            back_callback="admin_stats"
+        )
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "admin_stats_cal_range_reset")
+async def admin_stats_calendar_range_reset(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("❌ Нет доступа!")
+        return
+
+    await reset_admin_stats_filter(state)
+    
+    now = datetime.now().astimezone()
+    await state.update_data(admin_stats_cal_mode="range_from")
+    await safe_edit_message(
+        callback,
+        "📆 Выберите начальную дату диапазона:",
+        reply_markup=get_stats_calendar_keyboard("range_from", now.year, now.month, selected_from=None, back_callback="admin_stats")
+    )
+    await callback.answer("✅ Сброшено")
+
+
+@dp.callback_query(F.data.startswith("admin_stats_cal_range_show_"))
+async def admin_stats_calendar_range_show_selected(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("❌ Нет доступа!")
+        return
+
+    payload = callback.data.removeprefix("admin_stats_cal_range_show_")
+    parts = payload.split("_", 1)
+    if len(parts) != 2:
+        await callback.answer("❌ Неверный диапазон", show_alert=True)
+        return
+
+    selected_from, selected_to = parts
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", selected_from) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", selected_to):
+        await callback.answer("❌ Неверный диапазон", show_alert=True)
+        return
+
+    year, month, _ = selected_to.split("-")
+    await safe_edit_message(
+        callback,
+        f"📆 Период:\n"
+        f"• От: <b>{format_human_date_with_weekday(selected_from)}</b>\n"
+        f"• До: <b>{format_human_date_with_weekday(selected_to)}</b>\n"
+        f"<i>{format_human_date_full_ru(selected_from)} → {format_human_date_full_ru(selected_to)}</i>\n\n"
+        f"Обозначения в календаре: •DD — начало, DD• — конец",
+        parse_mode="HTML",
+        reply_markup=get_stats_calendar_keyboard(
+            "range_to",
+            int(year),
+            int(month),
+            selected_from=selected_from,
+            selected_to=selected_to,
+            back_callback="admin_stats"
+        )
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("admin_stats_cal_range_to_"))
+async def admin_stats_calendar_range_to_month(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("❌ Нет доступа!")
+        return
+
+    payload = callback.data.removeprefix("admin_stats_cal_range_to_")
+    parts = payload.split("_")
+    if len(parts) < 3:
+        await callback.answer()
+        return
+
+    selected_from = parts[0]
+    year = int(parts[1])
+    month = int(parts[2])
+
+    _, _, _, selected_to = await get_admin_stats_selection(state)
+    await state.update_data(admin_stats_cal_mode="range_to")
+    await safe_edit_message(
+        callback,
+        f"📆 Начало периода: <b>{format_human_date_with_weekday(selected_from)}</b>\n"
+        f"<i>{format_human_date_full_ru(selected_from)}</i>\n\n"
+        f"Выберите конечную дату:",
+        parse_mode="HTML",
+        reply_markup=get_stats_calendar_keyboard(
+            "range_to", year, month,
+            selected_from=selected_from,
+            selected_to=selected_to,
+            back_callback="admin_stats"
+        )
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("admin_stats_range_to_"))
+async def admin_stats_calendar_range_to_select(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("❌ Нет доступа!")
+        return
+
+    payload = callback.data.removeprefix("admin_stats_range_to_")
+    parts = payload.split("_", 1)
+    if len(parts) != 2:
+        await callback.answer("❌ Неверный диапазон", show_alert=True)
+        return
+
+    date_from, date_to = parts
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_from) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_to):
+        await callback.answer("❌ Неверный диапазон", show_alert=True)
+        return
+
+    if date_from > date_to:
+        await callback.answer("❌ Дата 'по' раньше даты 'с'", show_alert=True)
+        return
+
+    await set_admin_stats_range_filter(state, date_from, date_to)
+    year, month, _ = date_to.split("-")
+
+    await safe_edit_message(
+        callback,
+        f"📆 Период:\n"
+        f"• От: <b>{format_human_date_with_weekday(date_from)}</b>\n"
+        f"• До: <b>{format_human_date_with_weekday(date_to)}</b>\n"
+        f"<i>{format_human_date_full_ru(date_from)} → {format_human_date_full_ru(date_to)}</i>\n\n"
+        f"Обозначения в календаре: •DD — начало, DD• — конец",
+        parse_mode="HTML",
+        reply_markup=get_stats_calendar_keyboard(
+            "range_to",
+            int(year),
+            int(month),
+            selected_from=date_from,
+            selected_to=date_to,
+            back_callback="admin_stats"
+        )
+    )
+    await callback.answer("Диапазон выбран")
+
+
+@dp.callback_query(F.data.startswith("admin_stats_range_apply_"))
+async def admin_stats_calendar_range_apply(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("❌ Нет доступа!")
+        return
+
+    payload = callback.data.removeprefix("admin_stats_range_apply_")
+    parts = payload.split("_", 1)
+    if len(parts) != 2:
+        await callback.answer("❌ Неверный диапазон", show_alert=True)
+        return
+
+    date_from, date_to = parts
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_from) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_to):
+        await callback.answer("❌ Неверный диапазон", show_alert=True)
+        return
+
+    if date_from > date_to:
+        await callback.answer("❌ Дата 'по' раньше даты 'с'", show_alert=True)
+        return
+
+    await set_admin_stats_range_filter(state, date_from, date_to)
+    stats = await get_stats_by_date_range(date_from, date_to)
+
+    await safe_edit_message(
+        callback,
+        f"📊 <b>Статистика за период</b>\n"
+        f"• От: <b>{format_human_date_with_weekday(date_from)}</b>\n"
+        f"• До: <b>{format_human_date_with_weekday(date_to)}</b>\n"
+        f"<i>{format_human_date_full_ru(date_from)} → {format_human_date_full_ru(date_to)}</i>\n\n"
+        f"👥 Новых пользователей: <b>{stats['users']}</b>\n"
+        f"🎯 Создано команд: <b>{stats['commands']}</b>\n"
+        f"🔥 Использований (по созданным в периоде): <b>{stats['total_uses']}</b>\n"
+        f"❤️ Лайков (по созданным в периоде): <b>{stats['total_likes']}</b>\n"
+        f"🚩 Жалоб создано: <b>{stats['reports']}</b>\n\n"
+        f"📦 Активных команд (текущее): <b>{stats['active_commands_total']}</b>\n"
+        f"🚫 Заблокированных пользователей (текущее): <b>{stats['blocked_users_total']}</b>",
+        parse_mode="HTML",
+        reply_markup=get_admin_stats_keyboard("all", filter_type="range", selected_from=date_from, selected_to=date_to)
+    )
+    await callback.answer()
+
+
+@dp.callback_query(
+    F.data.startswith("admin_stats_")
+    & ~F.data.startswith("admin_stats_period_")
+    & ~F.data.startswith("admin_stats_pick_")
+    & ~F.data.startswith("admin_stats_cal_")
+    & ~F.data.startswith("admin_stats_day_")
+    & ~F.data.startswith("admin_stats_range_from_")
+    & ~F.data.startswith("admin_stats_range_to_")
+    & ~F.data.startswith("admin_stats_reset_")
+)
+async def admin_stats_period(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("❌ Нет доступа!")
+        return
+
+    period = callback.data.split("_")[-1]
+    await state.update_data(admin_stats_period=period)
+    await admin_stats_render(callback, state=state, period=period)
+
+
+async def admin_stats_render(callback: types.CallbackQuery, state: FSMContext, period: str = "all"):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("❌ Нет доступа!")
+        return
+
+    filter_type, selected_day, selected_from, selected_to = await get_admin_stats_selection(state)
+
+    stats = await get_stats_by_period(period)
+
+    period_title = {
+        "today": "за сегодня",
+        "week": "за 7 дней",
+        "month": "за месяц",
+        "all": "за всё время"
+    }.get(period, "за всё время")
+
+    await safe_edit_message(
+        callback,
+        f"📊 <b>Статистика {period_title}</b>\n\n"
+        f"👥 Новых пользователей: <b>{stats['users']}</b>\n"
+        f"🎯 Создано команд: <b>{stats['commands']}</b>\n"
+        f"🔥 Использований (по созданным в периоде): <b>{stats['total_uses']}</b>\n"
+        f"❤️ Лайков (по созданным в периоде): <b>{stats['total_likes']}</b>\n"
+        f"🚩 Жалоб создано: <b>{stats['reports']}</b>\n\n"
+        f"📦 Активных команд (текущее): <b>{stats['active_commands_total']}</b>\n"
+        f"🚫 Заблокированных пользователей (текущее): <b>{stats['blocked_users_total']}</b>",
+        parse_mode="HTML",
+        reply_markup=get_admin_stats_keyboard(period, filter_type=filter_type, selected_day=selected_day, selected_from=selected_from, selected_to=selected_to)
     )
     await callback.answer()
 
