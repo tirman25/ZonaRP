@@ -1314,10 +1314,17 @@ def get_stats_calendar_keyboard(
                 elif not selected_from and btn_day_date == current_local_date:
                     day_text = f"•{day_plain}•"
             else:
-                if selected_from and btn_date == selected_from:
-                    day_text = f"•{day_plain}"
-                if selected_to and btn_date == selected_to:
-                    day_text = f"{day_plain}•"
+                # Режим range (range_from или range_to)
+                if selected_from and selected_to and selected_from == selected_to:
+                    # Если диапазон из одного дня (выбор конкретного дня)
+                    if btn_date == selected_from:
+                        day_text = f"•{day_plain}•"
+                else:
+                    # Обычный диапазон
+                    if selected_from and btn_date == selected_from:
+                        day_text = f"•{day_plain}"
+                    if selected_to and btn_date == selected_to:
+                        day_text = f"{day_plain}•"
 
             if is_future or is_before_from:
                 week_row.append(InlineKeyboardButton(text=day_text, callback_data="noop"))
@@ -4003,7 +4010,7 @@ async def admin_stats_period(callback: types.CallbackQuery, state: FSMContext):
 
     period = callback.data.split("_")[-1]
     await state.update_data(admin_stats_period=period)
-    await admin_stats_render(callback, state=state, period=period)
+    await admin_stats(callback, state)
 
 
 async def admin_stats_render(callback: types.CallbackQuery, state: FSMContext, period: str = "all"):
@@ -4013,25 +4020,57 @@ async def admin_stats_render(callback: types.CallbackQuery, state: FSMContext, p
 
     filter_type, selected_day, selected_from, selected_to = await get_admin_stats_selection(state)
 
-    stats = await get_stats_by_period(period)
-
-    period_title = {
-        "today": "за сегодня",
-        "week": "за 7 дней",
-        "month": "за месяц",
-        "all": "за всё время"
-    }.get(period, "за всё время")
+    # Если есть активный фильтр, показываем статистику по нему, а не по периоду
+    if filter_type == "day" and selected_day:
+        stats = await get_stats_by_date_range(selected_day, selected_day)
+        text = (
+            f"📊 <b>Статистика за {format_human_date_with_weekday(selected_day)}</b>\n"
+            f"<i>{format_human_date_full_ru(selected_day)}</i>\n\n"
+            f"👥 Новых пользователей: <b>{stats['users']}</b>\n"
+            f"🎯 Создано команд: <b>{stats['commands']}</b>\n"
+            f"🔥 Использований (по созданным в дне): <b>{stats['total_uses']}</b>\n"
+            f"❤️ Лайков (по созданным в дне): <b>{stats['total_likes']}</b>\n"
+            f"🚩 Жалоб создано: <b>{stats['reports']}</b>\n\n"
+            f"📦 Активных команд (текущее): <b>{stats['active_commands_total']}</b>\n"
+            f"🚫 Заблокированных пользователей (текущее): <b>{stats['blocked_users_total']}</b>"
+        )
+    elif filter_type == "range" and selected_from and selected_to:
+        stats = await get_stats_by_date_range(selected_from, selected_to)
+        text = (
+            f"📊 <b>Статистика за период</b>\n"
+            f"• От: <b>{format_human_date_with_weekday(selected_from)}</b>\n"
+            f"• До: <b>{format_human_date_with_weekday(selected_to)}</b>\n"
+            f"<i>{format_human_date_full_ru(selected_from)} → {format_human_date_full_ru(selected_to)}</i>\n\n"
+            f"👥 Новых пользователей: <b>{stats['users']}</b>\n"
+            f"🎯 Создано команд: <b>{stats['commands']}</b>\n"
+            f"🔥 Использований (по созданным в периоде): <b>{stats['total_uses']}</b>\n"
+            f"❤️ Лайков (по созданным в периоде): <b>{stats['total_likes']}</b>\n"
+            f"🚩 Жалоб создано: <b>{stats['reports']}</b>\n\n"
+            f"📦 Активных команд (текущее): <b>{stats['active_commands_total']}</b>\n"
+            f"🚫 Заблокированных пользователей (текущее): <b>{stats['blocked_users_total']}</b>"
+        )
+    else:
+        stats = await get_stats_by_period(period)
+        period_title = {
+            "today": "за сегодня",
+            "week": "за 7 дней",
+            "month": "за месяц",
+            "all": "за всё время"
+        }.get(period, "за всё время")
+        text = (
+            f"📊 <b>Статистика {period_title}</b>\n\n"
+            f"👥 Новых пользователей: <b>{stats['users']}</b>\n"
+            f"🎯 Создано команд: <b>{stats['commands']}</b>\n"
+            f"🔥 Использований (по созданным в периоде): <b>{stats['total_uses']}</b>\n"
+            f"❤️ Лайков (по созданным в периоде): <b>{stats['total_likes']}</b>\n"
+            f"🚩 Жалоб создано: <b>{stats['reports']}</b>\n\n"
+            f"📦 Активных команд (текущее): <b>{stats['active_commands_total']}</b>\n"
+            f"🚫 Заблокированных пользователей (текущее): <b>{stats['blocked_users_total']}</b>"
+        )
 
     await safe_edit_message(
         callback,
-        f"📊 <b>Статистика {period_title}</b>\n\n"
-        f"👥 Новых пользователей: <b>{stats['users']}</b>\n"
-        f"🎯 Создано команд: <b>{stats['commands']}</b>\n"
-        f"🔥 Использований (по созданным в периоде): <b>{stats['total_uses']}</b>\n"
-        f"❤️ Лайков (по созданным в периоде): <b>{stats['total_likes']}</b>\n"
-        f"🚩 Жалоб создано: <b>{stats['reports']}</b>\n\n"
-        f"📦 Активных команд (текущее): <b>{stats['active_commands_total']}</b>\n"
-        f"🚫 Заблокированных пользователей (текущее): <b>{stats['blocked_users_total']}</b>",
+        text,
         parse_mode="HTML",
         reply_markup=get_admin_stats_keyboard(period, filter_type=filter_type, selected_day=selected_day, selected_from=selected_from, selected_to=selected_to)
     )
