@@ -921,13 +921,6 @@ def apply_advanced_template(template: str, me_link: str, target_link: str | None
     return result
 
 
-def normalize_button_style(style: str | None) -> str | None:
-    if not style:
-        return None
-    value = str(style).lower().strip()
-    return value if value in {"green", "red", "gray"} else None
-
-
 def build_advanced_keyboard(buttons: list, command_public_id: str, initiator_id: int, target_id: int) -> InlineKeyboardMarkup | None:
     if not buttons:
         return None
@@ -942,8 +935,7 @@ def build_advanced_keyboard(buttons: list, command_public_id: str, initiator_id:
         rows_map.setdefault(row_index, []).append(
             InlineKeyboardButton(
                 text=btn.get('name', f'Кнопка {i+1}'),
-                callback_data=f"rp_{command_public_id}_{initiator_id}_{target_id}_{i}",
-                style=normalize_button_style(btn.get('style'))
+                callback_data=f"rp_{command_public_id}_{initiator_id}_{target_id}_{i}"
             )
         )
 
@@ -1027,10 +1019,10 @@ def get_type_keyboard(back_callback: str = "back_main", include_menu: bool = Fal
 
 def get_more_buttons_keyboard(prefix: str = "more_buttons", allow_skip: bool = False, include_menu: bool = False) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    builder.button(text="➕ Добавить ещё", callback_data=f"{prefix}_yes")
-    builder.button(text="✅ Хватит", callback_data=f"{prefix}_no")
+    builder.button(text="➕ Да, добавить кнопки", callback_data=f"{prefix}_yes")
+    builder.button(text="⏭️ Без кнопок", callback_data=f"{prefix}_no")
     if allow_skip:
-        builder.button(text="⏭️ Без кнопок", callback_data=f"{prefix}_skip")
+        builder.button(text="⏭️ Пропустить", callback_data=f"{prefix}_skip")
     if include_menu:
         builder.button(text="🏠 Назад в меню", callback_data="back_main")
 
@@ -1067,7 +1059,7 @@ def get_create_buttons_manage_keyboard(buttons: list, mode: str = "target") -> I
 
     if len(buttons) < 6:
         builder.button(text="➕ Добавить ещё", callback_data=f"{prefix}_add")
-    builder.button(text="✅ Хватит", callback_data=f"{prefix}_done")
+    builder.button(text="✅ Готово (сохранить)", callback_data=f"{prefix}_done")
     builder.button(text="🏠 Назад в меню", callback_data="back_main")
     builder.adjust(1)
     return builder.as_markup()
@@ -2365,7 +2357,13 @@ async def create_adv_btn_open_from_edit(callback: types.CallbackQuery, state: FS
     await create_adv_btn_open(callback, state)
 
 @dp.callback_query(CreateCommandState.waiting_name, F.data == "create_back_to_name")
-async def create_back_to_name_from_name(callback: types.CallbackQuery):
+async def create_back_to_name_from_name(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.edit_text(
+        f"➕ Создание команды\n\n"
+        f"📝 Название ({MIN_COMMAND_NAME_LENGTH}-{MAX_COMMAND_NAME_LENGTH} символов):",
+        reply_markup=get_back_keyboard("back_main", include_menu=True)
+    )
+    await state.set_state(CreateCommandState.waiting_name)
     await callback.answer()
 
 @dp.callback_query(CreateCommandState.waiting_description, F.data == "create_back_to_name")
@@ -2646,7 +2644,7 @@ async def create_advanced_template(message: types.Message, state: FSMContext):
     await state.update_data(text_before=template, advanced_template=template, advanced_buttons=data.get('advanced_buttons', []))
     await message.answer(
         "🔘 Нужны ли кнопки для этой расширенной команды?",
-        reply_markup=get_more_buttons_keyboard(prefix="advanced_more_buttons", allow_skip=True, include_menu=True)
+        reply_markup=get_more_buttons_keyboard(prefix="advanced_more_buttons", include_menu=True)
     )
     await state.set_state(CreateCommandState.waiting_advanced_buttons_mode)
 
