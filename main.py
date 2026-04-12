@@ -47,6 +47,7 @@ async def init_db():
                 visibility TEXT NOT NULL DEFAULT 'public',
                 text_before TEXT,
                 buttons TEXT DEFAULT '[]',
+                advanced_config TEXT DEFAULT NULL,
                 likes INTEGER DEFAULT 0,
                 uses INTEGER DEFAULT 0,
                 is_active INTEGER DEFAULT 1,
@@ -60,6 +61,10 @@ async def init_db():
             pass
         try:
             await db.execute("ALTER TABLE commands ADD COLUMN visibility TEXT NOT NULL DEFAULT 'public'")
+        except Exception:
+            pass
+        try:
+            await db.execute("ALTER TABLE commands ADD COLUMN advanced_config TEXT DEFAULT NULL")
         except Exception:
             pass
         await db.execute("UPDATE commands SET public_id = lower(hex(randomblob(16))) WHERE public_id IS NULL OR public_id = ''")
@@ -134,12 +139,22 @@ async def is_user_blocked(user_id: int) -> bool:
 
 # ============= COMMANDS DB =============
 
-async def create_command_db(user_id: int, name: str, description: str, command_type: str, visibility: str, text_before: str, buttons: list) -> int:
+async def create_command_db(user_id: int, name: str, description: str, command_type: str, visibility: str, text_before: str, buttons: list, advanced_config: dict | None = None) -> int:
     async with aiosqlite.connect(DATABASE_PATH) as db:
         public_id = uuid.uuid4().hex
         cursor = await db.execute(
-            "INSERT INTO commands (public_id, name, description, creator_id, command_type, visibility, text_before, buttons) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (public_id, name.lower(), description, user_id, command_type, visibility, text_before, json.dumps(buttons, ensure_ascii=False))
+            "INSERT INTO commands (public_id, name, description, creator_id, command_type, visibility, text_before, buttons, advanced_config) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                public_id,
+                name.lower(),
+                description,
+                user_id,
+                command_type,
+                visibility,
+                text_before,
+                json.dumps(buttons, ensure_ascii=False),
+                json.dumps(advanced_config, ensure_ascii=False) if advanced_config else None
+            )
         )
         await db.commit()
         return cursor.lastrowid
@@ -763,6 +778,17 @@ class CreateCommandState(StatesGroup):
     waiting_button_name = State()
     waiting_button_result = State()
     waiting_more_buttons = State()
+    waiting_button_edit_name = State()
+    waiting_button_edit_result = State()
+    waiting_advanced_template = State()
+    waiting_advanced_buttons_mode = State()
+    waiting_advanced_button_name = State()
+    waiting_advanced_button_style = State()
+    waiting_advanced_button_result = State()
+    waiting_advanced_more_buttons = State()
+    waiting_advanced_button_edit_name = State()
+    waiting_advanced_button_edit_style = State()
+    waiting_advanced_button_edit_result = State()
 
 class SearchState(StatesGroup):
     waiting_query = State()
@@ -803,9 +829,12 @@ def get_main_menu_text(nickname: str) -> str:
         f"Выбирай раздел ниже 👇"
     )
 
-def get_back_keyboard(callback_data: str = "back_main") -> InlineKeyboardMarkup:
+def get_back_keyboard(callback_data: str = "back_main", include_menu: bool = False) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.button(text="◀️ Назад", callback_data=callback_data)
+    if include_menu:
+        builder.button(text="🏠 Назад в меню", callback_data="back_main")
+        builder.adjust(1)
     return builder.as_markup()
 
 
@@ -855,6 +884,71 @@ def format_db_datetime(value: str | None) -> str:
         return dt_utc.astimezone().strftime("%Y-%m-%d %H:%M:%S")
     except Exception:
         return str(value)
+
+
+def parse_buttons_json(raw_buttons: str | None) -> list:
+    try:
+        return json.loads(raw_buttons) if raw_buttons else []
+    except Exception:
+        return []
+
+
+def parse_advanced_config(command: dict) -> dict:
+    try:
+        return json.loads(command.get('advanced_config') or '{}')
+    except Exception:
+        return {}
+
+
+def has_template_target(template: str | None) -> bool:
+    return '[target]' in (template or '').lower()
+
+
+def format_user_link_html(user_id: int, first_name: str | None, username: str | None = None) -> str:
+    safe_name = html.escape(first_name or 'Игрок')
+    if username:
+        return f"<a href=\"https://t.me/{html.escape(username)}\">{safe_name}</a>"
+    return f"<a href=\"tg://user?id={user_id}\">{safe_name}</a>"
+
+
+def apply_advanced_template(template: str, me_link: str, target_link: str | None = None) -> str:
+    result = html.escape(template or '')
+    result = result.replace('[me]', me_link)
+    result = result.replace('[ME]', me_link)
+    if target_link is not None:
+        result = result.replace('[target]', target_link)
+        result = result.replace('[TARGET]', target_link)
+    return result
+
+
+def normalize_button_style(style: str | None) -> str | None:
+    if not style:
+        return None
+    value = str(style).lower().strip()
+    return value if value in {"green", "red", "gray"} else None
+
+
+def build_advanced_keyboard(buttons: list, command_public_id: str, initiator_id: int, target_id: int) -> InlineKeyboardMarkup | None:
+    if not buttons:
+        return None
+
+    rows_map: dict[int, list[InlineKeyboardButton]] = {}
+    for i, btn in enumerate(buttons[:6]):
+        try:
+            row_index = int(btn.get('row', 0) or 0)
+        except Exception:
+            row_index = i // 2
+
+        rows_map.setdefault(row_index, []).append(
+            InlineKeyboardButton(
+                text=btn.get('name', f'Кнопка {i+1}'),
+                callback_data=f"rp_{command_public_id}_{initiator_id}_{target_id}_{i}",
+                style=normalize_button_style(btn.get('style'))
+            )
+        )
+
+    rows = [rows_map[key] for key in sorted(rows_map.keys()) if rows_map[key]]
+    return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
 
 
 def get_commands_keyboard(commands: list, page: int = 0, total_pages: int = 1, prefix: str = "cmd") -> InlineKeyboardMarkup:
@@ -909,29 +1003,125 @@ def get_command_view_keyboard(command_id: int, is_owner: bool = False, liked: bo
     builder.button(text="🏠 В меню", callback_data="back_main")
     return builder.as_markup()
 
-def get_visibility_keyboard() -> InlineKeyboardMarkup:
+def get_visibility_keyboard(back_callback: str = "back_main", include_menu: bool = False) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.button(text="🌐 Видна всем", callback_data="visibility_public")
     builder.button(text="🔒 Только для меня", callback_data="visibility_private")
-    builder.button(text="◀️ Отмена", callback_data="back_main")
+    builder.button(text="◀️ Назад", callback_data=back_callback)
+    if include_menu:
+        builder.button(text="🏠 Назад в меню", callback_data="back_main")
     builder.adjust(1)
     return builder.as_markup()
 
 
-def get_type_keyboard() -> InlineKeyboardMarkup:
+def get_type_keyboard(back_callback: str = "back_main", include_menu: bool = False) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.button(text="👤 Для себя", callback_data="type_self")
     builder.button(text="👥 Для другого", callback_data="type_target")
-    builder.button(text="◀️ Отмена", callback_data="back_main")
+    builder.button(text="🧩 Расширенный", callback_data="type_advanced")
+    builder.button(text="◀️ Назад", callback_data=back_callback)
+    if include_menu:
+        builder.button(text="🏠 Назад в меню", callback_data="back_main")
     builder.adjust(1)
     return builder.as_markup()
 
-def get_more_buttons_keyboard() -> InlineKeyboardMarkup:
+def get_more_buttons_keyboard(prefix: str = "more_buttons", allow_skip: bool = False, include_menu: bool = False) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    builder.button(text="➕ Добавить ещё", callback_data="more_buttons_yes")
-    builder.button(text="✅ Хватит", callback_data="more_buttons_no")
-    builder.adjust(2)
+    builder.button(text="➕ Добавить ещё", callback_data=f"{prefix}_yes")
+    builder.button(text="✅ Хватит", callback_data=f"{prefix}_no")
+    if allow_skip:
+        builder.button(text="⏭️ Без кнопок", callback_data=f"{prefix}_skip")
+    if include_menu:
+        builder.button(text="🏠 Назад в меню", callback_data="back_main")
+
+    if allow_skip and include_menu:
+        builder.adjust(2, 1, 1)
+    elif allow_skip:
+        builder.adjust(2, 1)
+    elif include_menu:
+        builder.adjust(2, 1)
+    else:
+        builder.adjust(2)
     return builder.as_markup()
+
+
+def get_advanced_button_style_keyboard(back_callback: str = "back_main", prefix: str = "adv_btn_style") -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="⚪ Обычная", callback_data=f"{prefix}_default")
+    builder.button(text="🟢 Зелёная", callback_data=f"{prefix}_green")
+    builder.button(text="🔴 Красная", callback_data=f"{prefix}_red")
+    builder.button(text="⚫ Серая", callback_data=f"{prefix}_gray")
+    builder.button(text="◀️ Назад", callback_data=back_callback)
+    builder.button(text="🏠 Назад в меню", callback_data="back_main")
+    builder.adjust(2, 2, 1, 1)
+    return builder.as_markup()
+
+
+def get_create_buttons_manage_keyboard(buttons: list, mode: str = "target") -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    prefix = "create_btn" if mode == "target" else "create_adv_btn"
+
+    for i, btn in enumerate(buttons[:6]):
+        label = btn.get('name', f'Кнопка {i+1}')
+        builder.button(text=f"{i+1}. {label}", callback_data=f"{prefix}_open_{i}")
+
+    if len(buttons) < 6:
+        builder.button(text="➕ Добавить ещё", callback_data=f"{prefix}_add")
+    builder.button(text="✅ Хватит", callback_data=f"{prefix}_done")
+    builder.button(text="🏠 Назад в меню", callback_data="back_main")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def get_create_single_button_actions_keyboard(index: int, mode: str = "target") -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    prefix = "create_btn" if mode == "target" else "create_adv_btn"
+    builder.button(text="✏️ Изменить", callback_data=f"{prefix}_edit_{index}")
+    builder.button(text="🗑️ Удалить", callback_data=f"{prefix}_delete_{index}")
+    builder.button(text="◀️ Назад", callback_data=f"{prefix}_list")
+    builder.button(text="🏠 Назад в меню", callback_data="back_main")
+    builder.adjust(2, 1, 1)
+    return builder.as_markup()
+
+
+def normalize_advanced_buttons_rows(advanced_buttons: list[dict]) -> list[dict]:
+    normalized: list[dict] = []
+    for i, btn in enumerate(advanced_buttons[:6]):
+        item = dict(btn)
+        item['row'] = i // 2
+        normalized.append(item)
+    return normalized
+
+
+def build_target_buttons_manage_text(buttons: list[dict]) -> str:
+    lines = ["🔘 Управление кнопками (Для другого)", ""]
+    if not buttons:
+        lines.append("Кнопок пока нет.")
+    else:
+        lines.append("Выберите кнопку для изменения:")
+        lines.append("")
+        for i, btn in enumerate(buttons[:6], start=1):
+            lines.append(f"{i}. {html.escape(btn.get('name', 'Кнопка'))} → {html.escape(btn.get('result', ''))}")
+    lines.append("")
+    lines.append(f"📊 Кнопок: {len(buttons)}/6")
+    return "\n".join(lines)
+
+
+def build_advanced_buttons_manage_text(buttons: list[dict]) -> str:
+    lines = ["🔘 Управление кнопками (Расширенный)", ""]
+    if not buttons:
+        lines.append("Кнопок пока нет.")
+    else:
+        lines.append("Выберите кнопку для изменения:")
+        lines.append("")
+        for i, btn in enumerate(buttons[:6], start=1):
+            style = btn.get('style') or 'default'
+            lines.append(
+                f"{i}. {html.escape(btn.get('name', 'Кнопка'))} [{html.escape(style)}] → {html.escape(btn.get('result_template', ''))}"
+            )
+    lines.append("")
+    lines.append(f"📊 Кнопок: {len(buttons)}/6")
+    return "\n".join(lines)
 
 def get_report_keyboard(command_id: int) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
@@ -955,7 +1145,7 @@ def get_admin_reports_keyboard(reports: list, page: int, total_pages: int) -> In
         )
 
     builder.adjust(1)
-    
+
     if total_pages > 1:
         nav_buttons = []
         if page > 0:
@@ -1054,7 +1244,7 @@ def get_admin_user_commands_keyboard(commands: list, user_id: int, page: int, to
     for cmd in commands:
         status = "✅" if cmd.get('is_active') else "🗑️"
         visibility = "🔒" if cmd.get('visibility') == 'private' else "🌐"
-        cmd_type = "👤" if cmd.get('command_type') == 'self' else "👥"
+        cmd_type = "👤" if cmd.get('command_type') == 'self' else ("👥" if cmd.get('command_type') == 'target' else "🧩")
         builder.button(
             text=f"{status} {visibility} {cmd_type} {cmd['name']} · {cmd['uses']}× · ❤️ {cmd['likes']}",
             callback_data=f"admin_user_cmd_{cmd['id']}_{user_id}"
@@ -1727,8 +1917,10 @@ async def show_command(callback: types.CallbackQuery, command_id: int):
     
     if command['command_type'] == 'self':
         type_text = "👤 Для себя"
-    else:
+    elif command['command_type'] == 'target':
         type_text = "👥 Для другого"
+    else:
+        type_text = "🧩 Расширенный"
 
     if command.get('visibility') == 'private' and command['creator_id'] != user_id:
         await callback.answer("🔒 Это приватная команда", show_alert=True)
@@ -1736,14 +1928,26 @@ async def show_command(callback: types.CallbackQuery, command_id: int):
     
     visibility_text = "🔒 Только для меня" if command.get('visibility') == 'private' else "🌐 Видна всем"
 
+    details = []
+    if command['command_type'] == 'advanced':
+        advanced = parse_advanced_config(command)
+        details.append(f"🧩 Шаблон: <code>{html.escape((advanced.get('template') or command.get('text_before') or '-')[:700])}</code>")
+        advanced_buttons = advanced.get('buttons', [])[:6]
+        if advanced_buttons:
+            details.append(f"🔘 Кнопок: <b>{len(advanced_buttons)}</b>")
+            details.append("🎨 Стили: " + ", ".join(html.escape((btn.get('style') or 'default')) for btn in advanced_buttons))
+        else:
+            details.append("🔘 Кнопок: <b>0</b>")
+
     text = (
         f"🎯 <b>{html.escape(command['name'])}</b>\n\n"
         f"📝 {html.escape(command['description'] or 'Без описания')}\n"
         f"{type_text}\n"
         f"{visibility_text}\n"
-        f"👤 Автор: <b>{html.escape(command['creator_nickname'])}</b>\n\n"
-        f"📊 Использований: <b>{command['uses']}</b>\n"
-        f"❤️ Лайков: <b>{command['likes']}</b>"
+        f"👤 Автор: <b>{html.escape(command['creator_nickname'])}</b>\n"
+        + ("\n".join(details) + "\n\n" if details else "\n")
+        + f"📊 Использований: <b>{command['uses']}</b>\n"
+        + f"❤️ Лайков: <b>{command['likes']}</b>"
     )
 
     await callback.message.edit_text(
@@ -1770,17 +1974,17 @@ async def process_like(callback: types.CallbackQuery):
     if not command:
         await callback.answer("❌ Команда не найдена")
         return
-    
+
     if command.get('visibility') == 'private':
         await callback.answer("🔒 На приватные команды нельзя ставить лайк", show_alert=True)
         return
-    
+
     liked, likes = await toggle_like(user_id, command_id)
     
     if liked is None:
         await callback.answer("❌ Нельзя лайкать свою команду!", show_alert=True)
         return
-    
+
     await show_command(callback, command_id)
     await callback.answer("❤️ Лайк!" if liked else "💔 Лайк убран!")
 
@@ -2036,7 +2240,7 @@ async def menu_create(callback: types.CallbackQuery, state: FSMContext):
     await callback.message.edit_text(
         f"➕ Создание команды\n\n"
         f"📝 Название ({MIN_COMMAND_NAME_LENGTH}-{MAX_COMMAND_NAME_LENGTH} символов):",
-        reply_markup=get_back_keyboard()
+        reply_markup=get_back_keyboard("back_main", include_menu=True)
     )
     await state.set_state(CreateCommandState.waiting_name)
     await callback.answer()
@@ -2054,7 +2258,10 @@ async def create_name(message: types.Message, state: FSMContext):
         return
 
     await state.update_data(name=name)
-    await message.answer("📝 Описание команды:", reply_markup=get_back_keyboard())
+    await message.answer(
+        "📝 Описание команды:",
+        reply_markup=get_back_keyboard("create_back_to_name", include_menu=True)
+    )
     await state.set_state(CreateCommandState.waiting_description)
 
 @dp.message(CreateCommandState.waiting_description)
@@ -2062,7 +2269,7 @@ async def create_description(message: types.Message, state: FSMContext):
     await state.update_data(description=message.text.strip())
     await message.answer(
         "👁️ Кто будет видеть эту команду?",
-        reply_markup=get_visibility_keyboard()
+        reply_markup=get_visibility_keyboard("create_back_to_description", include_menu=True)
     )
     await state.set_state(CreateCommandState.waiting_visibility)
 
@@ -2075,8 +2282,9 @@ async def create_visibility(callback: types.CallbackQuery, state: FSMContext):
     await callback.message.edit_text(
         "🎭 Выберите тип команды:\n\n"
         "👤 Для себя — действие от вашего имени\n"
-        "👥 Для другого — действие с выбором ответа кнопкой",
-        reply_markup=get_type_keyboard()
+        "👥 Для другого — команда с кнопками ответа\n"
+        "🧩 Расширенный — шаблон с [me]/[target] и цветными кнопками",
+        reply_markup=get_type_keyboard("create_back_to_visibility", include_menu=True)
     )
     await state.set_state(CreateCommandState.waiting_type)
     await callback.answer()
@@ -2085,8 +2293,10 @@ async def create_visibility(callback: types.CallbackQuery, state: FSMContext):
 async def create_type(callback: types.CallbackQuery, state: FSMContext):
     if callback.data == "type_self":
         command_type = "self"
-    else:
+    elif callback.data == "type_target":
         command_type = "target"
+    else:
+        command_type = "advanced"
 
     await state.update_data(command_type=command_type)
 
@@ -2095,19 +2305,29 @@ async def create_type(callback: types.CallbackQuery, state: FSMContext):
             "📄 Введите текст команды.\n\n"
             "Пример: «упал(а)»\n"
             "Результат: Иван упал(а)",
-            reply_markup=get_back_keyboard()
+            reply_markup=get_back_keyboard("create_back_to_type", include_menu=True)
         )
         await state.set_state(CreateCommandState.waiting_text)
-    else:
+    elif command_type == "target":
         await state.update_data(has_buttons=True, buttons=[])
         await callback.message.edit_text(
             "📄 Введите текст команды (до выбора кнопки).\n\n"
-            "Пример: «хочет поцеловать»\n"
-            "Результат: Иван хочет поцеловать Машу\n\n"
+            "Пример: «хочет поцеловать».\n\n"
             "Далее вы добавите кнопки ответа.",
-            reply_markup=get_back_keyboard()
+            reply_markup=get_back_keyboard("create_back_to_type", include_menu=True)
         )
         await state.set_state(CreateCommandState.waiting_text_with_buttons)
+    else:
+        await state.update_data(advanced_buttons=[])
+        await callback.message.edit_text(
+            "🧩 Введите шаблон расширенной команды.\n\n"
+            "Можно использовать [me] и [target] в любом месте.\n"
+            "Обычный текст, без разметки.\n\n"
+            "Пример:\n"
+            "[me] кидает взгляд на [target] 👀",
+            reply_markup=get_back_keyboard("create_back_to_type", include_menu=True)
+        )
+        await state.set_state(CreateCommandState.waiting_advanced_template)
 
     await callback.answer()
 
@@ -2117,83 +2337,598 @@ async def create_text(message: types.Message, state: FSMContext):
     await state.update_data(text_before=message.text.strip())
     await finish_create(message, state)
 
+
+@dp.callback_query(CreateCommandState.waiting_button_name, F.data == "create_btn_list")
+async def create_target_btn_list_from_name(callback: types.CallbackQuery, state: FSMContext):
+    await render_create_target_buttons_menu(callback, state)
+    await callback.answer()
+
+
+@dp.callback_query(CreateCommandState.waiting_button_edit_name, F.data.startswith("create_btn_open_"))
+@dp.callback_query(CreateCommandState.waiting_button_edit_result, F.data.startswith("create_btn_open_"))
+async def create_target_btn_open_from_edit(callback: types.CallbackQuery, state: FSMContext):
+    await state.set_state(CreateCommandState.waiting_more_buttons)
+    await create_target_btn_open(callback, state)
+
+
+@dp.callback_query(CreateCommandState.waiting_advanced_button_name, F.data == "create_adv_btn_list")
+async def create_adv_btn_list_from_name(callback: types.CallbackQuery, state: FSMContext):
+    await render_create_advanced_buttons_menu(callback, state)
+    await callback.answer()
+
+
+@dp.callback_query(CreateCommandState.waiting_advanced_button_edit_name, F.data.startswith("create_adv_btn_open_"))
+@dp.callback_query(CreateCommandState.waiting_advanced_button_edit_style, F.data.startswith("create_adv_btn_open_"))
+@dp.callback_query(CreateCommandState.waiting_advanced_button_edit_result, F.data.startswith("create_adv_btn_open_"))
+async def create_adv_btn_open_from_edit(callback: types.CallbackQuery, state: FSMContext):
+    await state.set_state(CreateCommandState.waiting_advanced_more_buttons)
+    await create_adv_btn_open(callback, state)
+
+@dp.callback_query(CreateCommandState.waiting_name, F.data == "create_back_to_name")
+async def create_back_to_name_from_name(callback: types.CallbackQuery):
+    await callback.answer()
+
+@dp.callback_query(CreateCommandState.waiting_description, F.data == "create_back_to_name")
+async def create_back_to_name(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.edit_text(
+        f"➕ Создание команды\n\n"
+        f"📝 Название ({MIN_COMMAND_NAME_LENGTH}-{MAX_COMMAND_NAME_LENGTH} символов):",
+        reply_markup=get_back_keyboard("back_main")
+    )
+    await state.set_state(CreateCommandState.waiting_name)
+    await callback.answer()
+
+@dp.callback_query(CreateCommandState.waiting_visibility, F.data == "create_back_to_description")
+async def create_back_to_description(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.edit_text(
+        "📝 Описание команды:",
+        reply_markup=get_back_keyboard("create_back_to_name", include_menu=True)
+    )
+    await state.set_state(CreateCommandState.waiting_description)
+    await callback.answer()
+
+@dp.callback_query(CreateCommandState.waiting_type, F.data == "create_back_to_visibility")
+async def create_back_to_visibility(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.edit_text(
+        "👁️ Кто будет видеть эту команду?",
+        reply_markup=get_visibility_keyboard("create_back_to_description", include_menu=True)
+    )
+    await state.set_state(CreateCommandState.waiting_visibility)
+    await callback.answer()
+
+@dp.callback_query(
+    CreateCommandState.waiting_text,
+    F.data == "create_back_to_type"
+)
+@dp.callback_query(
+    CreateCommandState.waiting_text_with_buttons,
+    F.data == "create_back_to_type"
+)
+@dp.callback_query(
+    CreateCommandState.waiting_advanced_template,
+    F.data == "create_back_to_type"
+)
+@dp.callback_query(
+    CreateCommandState.waiting_advanced_buttons_mode,
+    F.data == "create_back_to_type"
+)
+async def create_back_to_type(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.edit_text(
+        "🎭 Выберите тип команды:\n\n"
+        "👤 Для себя — действие от вашего имени\n"
+        "👥 Для другого — команда с кнопками ответа\n"
+        "🧩 Расширенный — шаблон с [me]/[target] и цветными кнопками",
+        reply_markup=get_type_keyboard("create_back_to_visibility", include_menu=True)
+    )
+    await state.set_state(CreateCommandState.waiting_type)
+    await callback.answer()
+
+
+async def render_create_target_buttons_menu(target: types.Message | types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    buttons = data.get('buttons', [])[:6]
+    text = build_target_buttons_manage_text(buttons)
+    markup = get_create_buttons_manage_keyboard(buttons, mode="target")
+
+    if isinstance(target, types.CallbackQuery):
+        await target.message.edit_text(text, parse_mode="HTML", reply_markup=markup)
+    else:
+        await target.answer(text, parse_mode="HTML", reply_markup=markup)
+
+    await state.set_state(CreateCommandState.waiting_more_buttons)
+
+
+async def render_create_advanced_buttons_menu(target: types.Message | types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    buttons = data.get('advanced_buttons', [])[:6]
+    text = build_advanced_buttons_manage_text(buttons)
+    markup = get_create_buttons_manage_keyboard(buttons, mode="advanced")
+
+    if isinstance(target, types.CallbackQuery):
+        await target.message.edit_text(text, parse_mode="HTML", reply_markup=markup)
+    else:
+        await target.answer(text, parse_mode="HTML", reply_markup=markup)
+
+    await state.set_state(CreateCommandState.waiting_advanced_more_buttons)
+
+
 @dp.message(CreateCommandState.waiting_text_with_buttons)
 async def create_text_with_buttons(message: types.Message, state: FSMContext):
-    await state.update_data(text_before=message.text.strip(), buttons=[])
-    await message.answer(
-        "🔘 Кнопка 1/5\n\n"
-        "Введите название кнопки:\n"
-        "Пример: Принять, Да, Ок",
-        reply_markup=get_back_keyboard()
+    data = await state.get_data()
+    await state.update_data(text_before=(message.text or "").strip(), buttons=data.get('buttons', []))
+    await render_create_target_buttons_menu(message, state)
+
+
+@dp.callback_query(CreateCommandState.waiting_more_buttons, F.data == "create_btn_add")
+async def create_target_btn_add(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    count = len(data.get('buttons', []))
+    if count >= 6:
+        await callback.answer("❌ Доступно максимум 6 кнопок", show_alert=True)
+        return
+
+    await callback.message.edit_text(
+        f"🔘 Кнопка {count + 1}/6\n\nВведите название кнопки:",
+        reply_markup=get_back_keyboard("create_btn_list", include_menu=True)
     )
     await state.set_state(CreateCommandState.waiting_button_name)
+    await callback.answer()
+
+
+@dp.callback_query(CreateCommandState.waiting_more_buttons, F.data == "create_btn_done")
+async def create_target_btn_done(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    if not data.get('buttons'):
+        await callback.answer("❌ Добавьте хотя бы одну кнопку", show_alert=True)
+        return
+    await finish_create(callback.message, state)
+    await callback.answer()
+
+
+@dp.callback_query(CreateCommandState.waiting_more_buttons, F.data.startswith("create_btn_open_"))
+async def create_target_btn_open(callback: types.CallbackQuery, state: FSMContext):
+    index = int(callback.data.split("_")[-1])
+    data = await state.get_data()
+    buttons = data.get('buttons', [])
+    if index < 0 or index >= len(buttons):
+        await callback.answer("❌ Кнопка не найдена", show_alert=True)
+        return
+
+    button = buttons[index]
+    await callback.message.edit_text(
+        f"🔘 Кнопка {index + 1}\n\n"
+        f"Название: {html.escape(button.get('name', ''))}\n"
+        f"Результат: {html.escape(button.get('result', ''))}",
+        parse_mode="HTML",
+        reply_markup=get_create_single_button_actions_keyboard(index, mode="target")
+    )
+    await callback.answer()
+
+
+@dp.callback_query(CreateCommandState.waiting_more_buttons, F.data == "create_btn_list")
+async def create_target_btn_list(callback: types.CallbackQuery, state: FSMContext):
+    await render_create_target_buttons_menu(callback, state)
+    await callback.answer()
+
+
+@dp.callback_query(CreateCommandState.waiting_more_buttons, F.data.startswith("create_btn_delete_"))
+async def create_target_btn_delete(callback: types.CallbackQuery, state: FSMContext):
+    index = int(callback.data.split("_")[-1])
+    data = await state.get_data()
+    buttons = data.get('buttons', [])
+    if index < 0 or index >= len(buttons):
+        await callback.answer("❌ Кнопка не найдена", show_alert=True)
+        return
+
+    removed = buttons.pop(index)
+    await state.update_data(buttons=buttons)
+    await render_create_target_buttons_menu(callback, state)
+    await callback.answer(f"🗑️ Удалено: {removed.get('name', 'кнопка')}")
+
+
+@dp.callback_query(CreateCommandState.waiting_more_buttons, F.data.startswith("create_btn_edit_"))
+async def create_target_btn_edit(callback: types.CallbackQuery, state: FSMContext):
+    index = int(callback.data.split("_")[-1])
+    data = await state.get_data()
+    buttons = data.get('buttons', [])
+    if index < 0 or index >= len(buttons):
+        await callback.answer("❌ Кнопка не найдена", show_alert=True)
+        return
+
+    await state.update_data(edit_button_index=index)
+    await callback.message.edit_text(
+        f"✏️ Изменение кнопки {index + 1}\n\nВведите новое название:",
+        reply_markup=get_back_keyboard(f"create_btn_open_{index}", include_menu=True)
+    )
+    await state.set_state(CreateCommandState.waiting_button_edit_name)
+    await callback.answer()
+
 
 @dp.message(CreateCommandState.waiting_button_name)
 async def create_button_name(message: types.Message, state: FSMContext):
-    await state.update_data(current_button_name=message.text.strip())
-    
+    name = (message.text or "").strip()
+    if not name:
+        await message.answer("❌ Название кнопки не может быть пустым")
+        return
+
+    await state.update_data(current_button_name=name)
     await message.answer(
         "📄 Введите результат при нажатии:\n"
         "Пример: обнял(а) → Иван обнял(а) Машу",
-        reply_markup=get_back_keyboard()
+        reply_markup=get_back_keyboard("create_back_to_target_button_name", include_menu=True)
     )
     await state.set_state(CreateCommandState.waiting_button_result)
 
-@dp.message(CreateCommandState.waiting_button_result)
-async def create_button_result(message: types.Message, state: FSMContext):
-    data = await state.get_data()
-    buttons = data.get('buttons', [])
-    current_name = data.get('current_button_name')
-    
-    buttons.append({
-        "name": current_name,
-        "result": message.text.strip()
-    })
-    
-    await state.update_data(buttons=buttons)
-    
-    if len(buttons) >= 5:
-        await finish_create(message, state)
-    else:
-        await message.answer(
-            f"✅ Кнопка «{current_name}» добавлена!\n\n"
-            f"📊 Кнопок: {len(buttons)}/5",
-            reply_markup=get_more_buttons_keyboard()
-        )
-        await state.set_state(CreateCommandState.waiting_more_buttons)
 
-@dp.callback_query(CreateCommandState.waiting_more_buttons, F.data == "more_buttons_yes")
-async def more_buttons_yes(callback: types.CallbackQuery, state: FSMContext):
+@dp.callback_query(CreateCommandState.waiting_button_result, F.data == "create_back_to_target_button_name")
+async def create_back_to_target_button_name(callback: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
     count = len(data.get('buttons', []))
-    
     await callback.message.edit_text(
-        f"🔘 Кнопка {count + 1}/5\n\n"
-        "Введите название кнопки:",
-        reply_markup=get_back_keyboard()
+        f"🔘 Кнопка {count + 1}/6\n\nВведите название кнопки:",
+        reply_markup=get_back_keyboard("create_btn_list", include_menu=True)
     )
     await state.set_state(CreateCommandState.waiting_button_name)
     await callback.answer()
 
-@dp.callback_query(CreateCommandState.waiting_more_buttons, F.data == "more_buttons_no")
-async def more_buttons_no(callback: types.CallbackQuery, state: FSMContext):
+
+@dp.message(CreateCommandState.waiting_button_result)
+async def create_button_result(message: types.Message, state: FSMContext):
+    result_text = (message.text or "").strip()
+    if not result_text:
+        await message.answer("❌ Результат не может быть пустым")
+        return
+
+    data = await state.get_data()
+    buttons = data.get('buttons', [])
+    current_name = data.get('current_button_name')
+
+    buttons.append({
+        "name": current_name,
+        "result": result_text
+    })
+
+    await state.update_data(buttons=buttons)
+
+    if len(buttons) >= 6:
+        await finish_create(message, state)
+        return
+
+    await render_create_target_buttons_menu(message, state)
+
+
+@dp.message(CreateCommandState.waiting_button_edit_name)
+async def create_target_btn_edit_name(message: types.Message, state: FSMContext):
+    new_name = (message.text or "").strip()
+    if not new_name:
+        await message.answer("❌ Название кнопки не может быть пустым")
+        return
+
+    await state.update_data(edit_button_name=new_name)
+    data = await state.get_data()
+    idx = data.get('edit_button_index', 0)
+    await message.answer(
+        f"✏️ Изменение кнопки {idx + 1}\n\nВведите новый результат:",
+        reply_markup=get_back_keyboard(f"create_btn_open_{idx}", include_menu=True)
+    )
+    await state.set_state(CreateCommandState.waiting_button_edit_result)
+
+
+@dp.message(CreateCommandState.waiting_button_edit_result)
+async def create_target_btn_edit_result(message: types.Message, state: FSMContext):
+    new_result = (message.text or "").strip()
+    if not new_result:
+        await message.answer("❌ Результат не может быть пустым")
+        return
+
+    data = await state.get_data()
+    idx = data.get('edit_button_index')
+    buttons = data.get('buttons', [])
+    if idx is None or idx < 0 or idx >= len(buttons):
+        await message.answer("❌ Кнопка не найдена")
+        await render_create_target_buttons_menu(message, state)
+        return
+
+    buttons[idx]['name'] = data.get('edit_button_name')
+    buttons[idx]['result'] = new_result
+    await state.update_data(buttons=buttons)
+    await render_create_target_buttons_menu(message, state)
+
+
+@dp.message(CreateCommandState.waiting_advanced_template)
+async def create_advanced_template(message: types.Message, state: FSMContext):
+    template = (message.text or "").strip()
+    if not template:
+        await message.answer("❌ Шаблон не может быть пустым")
+        return
+
+    data = await state.get_data()
+    await state.update_data(text_before=template, advanced_template=template, advanced_buttons=data.get('advanced_buttons', []))
+    await message.answer(
+        "🔘 Нужны ли кнопки для этой расширенной команды?",
+        reply_markup=get_more_buttons_keyboard(prefix="advanced_more_buttons", allow_skip=True, include_menu=True)
+    )
+    await state.set_state(CreateCommandState.waiting_advanced_buttons_mode)
+
+
+@dp.callback_query(CreateCommandState.waiting_advanced_buttons_mode, F.data == "advanced_more_buttons_skip")
+async def create_advanced_without_buttons(callback: types.CallbackQuery, state: FSMContext):
+    await state.update_data(advanced_buttons=[])
     await finish_create(callback.message, state)
     await callback.answer()
+
+
+@dp.callback_query(CreateCommandState.waiting_advanced_buttons_mode, F.data == "advanced_more_buttons_no")
+async def create_advanced_without_buttons_no(callback: types.CallbackQuery, state: FSMContext):
+    await state.update_data(advanced_buttons=[])
+    await finish_create(callback.message, state)
+    await callback.answer()
+
+
+@dp.callback_query(CreateCommandState.waiting_advanced_buttons_mode, F.data == "advanced_more_buttons_yes")
+async def create_advanced_with_buttons(callback: types.CallbackQuery, state: FSMContext):
+    await render_create_advanced_buttons_menu(callback, state)
+    await callback.answer()
+
+
+@dp.callback_query(CreateCommandState.waiting_advanced_more_buttons, F.data == "create_adv_btn_add")
+async def create_adv_btn_add(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    count = len(data.get('advanced_buttons', []))
+    if count >= 6:
+        await callback.answer("❌ Доступно максимум 6 кнопок", show_alert=True)
+        return
+
+    await callback.message.edit_text(
+        f"🔘 Кнопка {count + 1}/6\n\nВведите название кнопки:",
+        reply_markup=get_back_keyboard("create_adv_btn_list", include_menu=True)
+    )
+    await state.set_state(CreateCommandState.waiting_advanced_button_name)
+    await callback.answer()
+
+
+@dp.callback_query(CreateCommandState.waiting_advanced_more_buttons, F.data == "create_adv_btn_done")
+async def create_adv_btn_done(callback: types.CallbackQuery, state: FSMContext):
+    await finish_create(callback.message, state)
+    await callback.answer()
+
+
+@dp.callback_query(CreateCommandState.waiting_advanced_more_buttons, F.data.startswith("create_adv_btn_open_"))
+async def create_adv_btn_open(callback: types.CallbackQuery, state: FSMContext):
+    index = int(callback.data.split("_")[-1])
+    data = await state.get_data()
+    buttons = data.get('advanced_buttons', [])
+    if index < 0 or index >= len(buttons):
+        await callback.answer("❌ Кнопка не найдена", show_alert=True)
+        return
+
+    button = buttons[index]
+    await callback.message.edit_text(
+        f"🔘 Кнопка {index + 1}\n\n"
+        f"Название: {html.escape(button.get('name', ''))}\n"
+        f"Цвет: {html.escape(button.get('style') or 'default')}\n"
+        f"Результат: {html.escape(button.get('result_template', ''))}",
+        parse_mode="HTML",
+        reply_markup=get_create_single_button_actions_keyboard(index, mode="advanced")
+    )
+    await callback.answer()
+
+
+@dp.callback_query(CreateCommandState.waiting_advanced_more_buttons, F.data == "create_adv_btn_list")
+async def create_adv_btn_list(callback: types.CallbackQuery, state: FSMContext):
+    await render_create_advanced_buttons_menu(callback, state)
+    await callback.answer()
+
+
+@dp.callback_query(CreateCommandState.waiting_advanced_more_buttons, F.data.startswith("create_adv_btn_delete_"))
+async def create_adv_btn_delete(callback: types.CallbackQuery, state: FSMContext):
+    index = int(callback.data.split("_")[-1])
+    data = await state.get_data()
+    buttons = data.get('advanced_buttons', [])
+    if index < 0 or index >= len(buttons):
+        await callback.answer("❌ Кнопка не найдена", show_alert=True)
+        return
+
+    removed = buttons.pop(index)
+    buttons = normalize_advanced_buttons_rows(buttons)
+    await state.update_data(advanced_buttons=buttons)
+    await render_create_advanced_buttons_menu(callback, state)
+    await callback.answer(f"🗑️ Удалено: {removed.get('name', 'кнопка')}")
+
+
+@dp.callback_query(CreateCommandState.waiting_advanced_more_buttons, F.data.startswith("create_adv_btn_edit_"))
+async def create_adv_btn_edit(callback: types.CallbackQuery, state: FSMContext):
+    index = int(callback.data.split("_")[-1])
+    data = await state.get_data()
+    buttons = data.get('advanced_buttons', [])
+    if index < 0 or index >= len(buttons):
+        await callback.answer("❌ Кнопка не найдена", show_alert=True)
+        return
+
+    await state.update_data(edit_adv_button_index=index)
+    await callback.message.edit_text(
+        f"✏️ Изменение кнопки {index + 1}\n\nВведите новое название:",
+        reply_markup=get_back_keyboard(f"create_adv_btn_open_{index}", include_menu=True)
+    )
+    await state.set_state(CreateCommandState.waiting_advanced_button_edit_name)
+    await callback.answer()
+
+
+@dp.message(CreateCommandState.waiting_advanced_button_name)
+async def create_advanced_button_name(message: types.Message, state: FSMContext):
+    button_name = (message.text or "").strip()
+    if not button_name:
+        await message.answer("❌ Название кнопки не может быть пустым")
+        return
+
+    await state.update_data(current_advanced_button_name=button_name)
+    await message.answer(
+        "🎨 Выберите цвет кнопки:",
+        reply_markup=get_advanced_button_style_keyboard(back_callback="create_back_to_adv_button_name")
+    )
+    await state.set_state(CreateCommandState.waiting_advanced_button_style)
+
+
+@dp.callback_query(CreateCommandState.waiting_advanced_button_style, F.data == "create_back_to_adv_button_name")
+async def create_back_to_adv_button_name(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    count = len(data.get('advanced_buttons', []))
+    await callback.message.edit_text(
+        f"🔘 Кнопка {count + 1}/6\n\nВведите название кнопки:",
+        reply_markup=get_back_keyboard("create_adv_btn_list", include_menu=True)
+    )
+    await state.set_state(CreateCommandState.waiting_advanced_button_name)
+    await callback.answer()
+
+
+@dp.callback_query(CreateCommandState.waiting_advanced_button_style, F.data.startswith("adv_btn_style_"))
+async def create_advanced_button_style(callback: types.CallbackQuery, state: FSMContext):
+    style_value = callback.data.removeprefix("adv_btn_style_")
+    if style_value == "default":
+        style_value = None
+
+    await state.update_data(current_advanced_button_style=style_value)
+    await callback.message.edit_text(
+        "📄 Введите шаблон результата этой кнопки.\n\n"
+        "Можно использовать [me] и [target] в любом месте.\n"
+        "Обычный текст, без разметки.",
+        reply_markup=get_back_keyboard("create_back_to_adv_button_style", include_menu=True)
+    )
+    await state.set_state(CreateCommandState.waiting_advanced_button_result)
+    await callback.answer()
+
+
+@dp.callback_query(CreateCommandState.waiting_advanced_button_result, F.data == "create_back_to_adv_button_style")
+async def create_back_to_adv_button_style(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.edit_text(
+        "🎨 Выберите цвет кнопки:",
+        reply_markup=get_advanced_button_style_keyboard(back_callback="create_back_to_adv_button_name")
+    )
+    await state.set_state(CreateCommandState.waiting_advanced_button_style)
+    await callback.answer()
+
+
+@dp.message(CreateCommandState.waiting_advanced_button_result)
+async def create_advanced_button_result(message: types.Message, state: FSMContext):
+    result_template = (message.text or "").strip()
+    if not result_template:
+        await message.answer("❌ Шаблон результата не может быть пустым")
+        return
+
+    data = await state.get_data()
+    advanced_buttons = data.get('advanced_buttons', [])
+    current_name = data.get('current_advanced_button_name')
+    current_style = data.get('current_advanced_button_style')
+
+    advanced_buttons.append({
+        "name": current_name,
+        "style": current_style,
+        "result_template": result_template,
+        "row": len(advanced_buttons) // 2
+    })
+
+    advanced_buttons = normalize_advanced_buttons_rows(advanced_buttons)
+    await state.update_data(advanced_buttons=advanced_buttons)
+
+    if len(advanced_buttons) >= 6:
+        await finish_create(message, state)
+        return
+
+    await render_create_advanced_buttons_menu(message, state)
+
+
+@dp.message(CreateCommandState.waiting_advanced_button_edit_name)
+async def create_adv_btn_edit_name(message: types.Message, state: FSMContext):
+    new_name = (message.text or "").strip()
+    if not new_name:
+        await message.answer("❌ Название кнопки не может быть пустым")
+        return
+
+    await state.update_data(edit_adv_button_name=new_name)
+    data = await state.get_data()
+    idx = data.get('edit_adv_button_index', 0)
+    await message.answer(
+        f"🎨 Изменение кнопки {idx + 1}: выберите цвет",
+        reply_markup=get_advanced_button_style_keyboard(
+            back_callback=f"create_adv_btn_open_{idx}",
+            prefix="adv_btn_edit_style"
+        )
+    )
+    await state.set_state(CreateCommandState.waiting_advanced_button_edit_style)
+
+
+@dp.callback_query(CreateCommandState.waiting_advanced_button_edit_style, F.data == "create_adv_btn_list")
+async def create_adv_btn_list_from_edit_style(callback: types.CallbackQuery, state: FSMContext):
+    await render_create_advanced_buttons_menu(callback, state)
+    await callback.answer()
+
+
+@dp.callback_query(CreateCommandState.waiting_advanced_button_edit_style, F.data.startswith("adv_btn_edit_style_"))
+async def create_adv_btn_edit_style(callback: types.CallbackQuery, state: FSMContext):
+    style_value = callback.data.removeprefix("adv_btn_edit_style_")
+    if style_value == "default":
+        style_value = None
+
+    await state.update_data(edit_adv_button_style=style_value)
+    data = await state.get_data()
+    idx = data.get('edit_adv_button_index', 0)
+    await callback.message.edit_text(
+        f"✏️ Изменение кнопки {idx + 1}\n\nВведите новый шаблон результата:",
+        reply_markup=get_back_keyboard(f"create_adv_btn_open_{idx}", include_menu=True)
+    )
+    await state.set_state(CreateCommandState.waiting_advanced_button_edit_result)
+    await callback.answer()
+
+
+@dp.message(CreateCommandState.waiting_advanced_button_edit_result)
+async def create_adv_btn_edit_result(message: types.Message, state: FSMContext):
+    new_result = (message.text or "").strip()
+    if not new_result:
+        await message.answer("❌ Шаблон результата не может быть пустым")
+        return
+    
+    data = await state.get_data()
+    idx = data.get('edit_adv_button_index')
+    buttons = data.get('advanced_buttons', [])
+    if idx is None or idx < 0 or idx >= len(buttons):
+        await message.answer("❌ Кнопка не найдена")
+        await render_create_advanced_buttons_menu(message, state)
+        return
+
+    buttons[idx]['name'] = data.get('edit_adv_button_name')
+    buttons[idx]['style'] = data.get('edit_adv_button_style')
+    buttons[idx]['result_template'] = new_result
+    buttons = normalize_advanced_buttons_rows(buttons)
+    await state.update_data(advanced_buttons=buttons)
+    await render_create_advanced_buttons_menu(message, state)
 
 async def finish_create(message: types.Message, state: FSMContext):
     data = await state.get_data()
     user_id = message.chat.id
-    
+
     name = data.get('name')
     description = data.get('description', '')
     command_type = data.get('command_type', 'self')
     visibility = data.get('visibility', 'public')
     text_before = data.get('text_before', '')
     buttons = data.get('buttons', [])
-    
+    advanced_config = None
+
+    if command_type == 'advanced':
+        advanced_buttons = data.get('advanced_buttons', [])[:6]
+        advanced_config = {
+            "template": data.get('advanced_template') or text_before,
+            "buttons": advanced_buttons,
+            "requires_target": has_template_target(data.get('advanced_template') or text_before) or any(
+                has_template_target(btn.get('result_template')) for btn in advanced_buttons
+            ),
+            "supports_rich_text": False
+        }
+        buttons = []
+
     try:
-        command_id = await create_command_db(user_id, name, description, command_type, visibility, text_before, buttons)
-        
+        command_id = await create_command_db(user_id, name, description, command_type, visibility, text_before, buttons, advanced_config=advanced_config)
+
         if command_id:
             await message.answer(
                 f"✅ Команда «{name}» создана!\n\n"
@@ -2210,7 +2945,7 @@ async def finish_create(message: types.Message, state: FSMContext):
     except Exception as e:
         logger.error(f"Error creating command: {e}")
         await message.answer(f"❌ Ошибка: {str(e)}", reply_markup=get_main_keyboard(user_id))
-    
+
     await state.clear()
 
 # ============= INLINE ЗАПРОС =============
@@ -2270,28 +3005,22 @@ async def inline_query(query: types.InlineQuery):
             )
         )
         return
-    
+
     def build_inline_article(cmd: dict, title_prefix: str = "🎯") -> InlineQueryResultArticle:
         initiator_name = query.from_user.first_name or "Игрок"
         initiator_username = query.from_user.username
-        if initiator_username:
-            initiator_link = f"<a href=\"https://t.me/{html.escape(initiator_username)}\">{html.escape(initiator_name)}</a>"
-        else:
-            initiator_link = f"<a href=\"tg://user?id={user_id}\">{html.escape(initiator_name)}</a>"
+        initiator_link = format_user_link_html(user_id, initiator_name, initiator_username)
 
         if cmd['command_type'] == 'self':
             message_text = f"{initiator_link} {html.escape(cmd['text_before'])}"
             markup = None
-        else:
+        elif cmd['command_type'] == 'target':
             message_text = f"{initiator_link} {html.escape(cmd['text_before'])}"
-            try:
-                buttons = json.loads(cmd['buttons']) if cmd['buttons'] else []
-            except:
-                buttons = []
+            buttons = parse_buttons_json(cmd.get('buttons'))
 
             if buttons:
                 kb = InlineKeyboardBuilder()
-                for i, btn in enumerate(buttons):
+                for i, btn in enumerate(buttons[:6]):
                     kb.button(text=btn['name'], callback_data=f"rp_{cmd['public_id']}_{user_id}_0_{i}")
                 kb.adjust(2)
                 markup = kb.as_markup()
@@ -2301,6 +3030,17 @@ async def inline_query(query: types.InlineQuery):
                 elif target_mention:
                     message_text = f"{message_text} {html.escape(target_mention)}"
                 markup = None
+        else:
+            advanced = parse_advanced_config(cmd)
+            advanced_buttons = advanced.get('buttons', [])[:6]
+            target_link_for_template = target_link_html or (html.escape(target_mention) if target_mention else None)
+            message_text = apply_advanced_template(
+                advanced.get('template') or cmd.get('text_before') or '',
+                initiator_link,
+                target_link_for_template
+            )
+            target_id_for_buttons = 0 if advanced.get('requires_target') else -1
+            markup = build_advanced_keyboard(advanced_buttons, cmd['public_id'], user_id, target_id_for_buttons)
 
         visibility_mark = "🔒 " if cmd.get('visibility') == 'private' else ""
 
@@ -2354,7 +3094,7 @@ async def chosen_inline_result_handler(chosen: ChosenInlineResult):
         or chosen.result_id.startswith("cmdv3_")
     ):
         return
-    
+
     if chosen.result_id.startswith("cmdv3_"):
         public_id = chosen.result_id[6:]
     elif chosen.result_id.startswith("cmdv2_"):
@@ -2434,24 +3174,50 @@ async def execute_text_command(message: types.Message):
 
 async def execute_command(message: types.Message, command: dict, user: dict):
     """Выполнение RP команды"""
-    user_id = user['user_id']
     initiator = message.from_user
     initiator_id = initiator.id
     initiator_name = initiator.first_name
-    
-    # Создаём кликабельную ссылку на профиль
-    initiator_link = f"[{initiator_name}](tg://user?id={initiator_id})"
+    initiator_username = initiator.username
+    initiator_link_html = format_user_link_html(initiator_id, initiator_name, initiator_username)
+    initiator_link_md = f"[{initiator_name}](tg://user?id={initiator_id})"
     
     if command['command_type'] == 'self':
-        text = f"{initiator_link} {command['text_before']}"
+        text = f"{initiator_link_md} {command['text_before']}"
         await message.answer(text, parse_mode="Markdown")
         await increment_uses(command['id'])
         return
     
-    target = None
-    if message.reply_to_message:
-        target = message.reply_to_message.from_user
-    
+    target = message.reply_to_message.from_user if message.reply_to_message else None
+
+    if command['command_type'] == 'advanced':
+        advanced = parse_advanced_config(command)
+        requires_target = bool(advanced.get('requires_target'))
+        target_link_html = None
+        target_id_for_buttons = -1
+
+        if requires_target:
+            if not target:
+                await message.answer("❌ Для этой команды нужна цель: ответьте на сообщение игрока.")
+                return
+            target_link_html = format_user_link_html(target.id, target.first_name, target.username)
+            target_id_for_buttons = target.id
+
+        rendered_text = apply_advanced_template(
+            advanced.get('template') or command.get('text_before') or '',
+            initiator_link_html,
+            target_link_html
+        )
+        markup = build_advanced_keyboard(
+            advanced.get('buttons', [])[:6],
+            command['public_id'],
+            initiator_id,
+            target_id_for_buttons if advanced.get('buttons') else target_id_for_buttons
+        )
+
+        await message.answer(rendered_text, parse_mode="HTML", reply_markup=markup, disable_web_page_preview=True)
+        await increment_uses(command['id'])
+        return
+
     if not target:
         await message.answer("❌ Ответьте на сообщение игрока!")
         return
@@ -2459,25 +3225,20 @@ async def execute_command(message: types.Message, command: dict, user: dict):
     target_name = target.first_name
     target_id = target.id
     target_link = f"[{target_name}](tg://user?id={target_id})"
-    
-    try:
-        buttons = json.loads(command['buttons']) if command['buttons'] else []
-    except:
-        buttons = []
 
-    # Для типа "Для другого" без кнопок создание запрещено,
-    # но для старых записей даём понятную диагностику.
+    buttons = parse_buttons_json(command.get('buttons'))
+
     if not buttons:
         await message.answer("❌ Для команды типа «Для другого» нужны кнопки. Пересоздайте команду.")
         return
     
-    text = f"{initiator_link} {command['text_before']} {target_link}"
-    
+    text = f"{initiator_link_md} {command['text_before']} {target_link}"
+
     builder = InlineKeyboardBuilder()
-    for i, btn in enumerate(buttons):
+    for i, btn in enumerate(buttons[:6]):
         builder.button(text=btn['name'], callback_data=f"rp_{command['public_id']}_{initiator_id}_{target_id}_{i}")
     builder.adjust(1)
-    
+
     await message.answer(text, parse_mode="Markdown", reply_markup=builder.as_markup())
     await increment_uses(command['id'])
 
@@ -2489,70 +3250,32 @@ async def rp_button_press(callback: types.CallbackQuery):
     target_id = int(parts[3])
     button_index = int(parts[4])
     
-    # Для inline-режима target_id=0: цель определяется первым нажавшим (кроме инициатора)
     if target_id == 0:
         if callback.from_user.id == initiator_id:
             await callback.answer("❌ Нельзя нажать на свою же кнопку!", show_alert=True)
             return
         target_id = callback.from_user.id
-    elif callback.from_user.id != target_id:
+    elif target_id > 0 and callback.from_user.id != target_id:
         await callback.answer("❌ Только адресат может нажать!", show_alert=True)
         return
-    
+
     command = await get_command_by_public_id(command_token)
     if not command and command_token.isdigit():
         command = await get_command(int(command_token))
     if not command:
         await callback.answer("❌ Команда не найдена!")
         return
-    
-    
-    try:
-        buttons = json.loads(command['buttons']) if command['buttons'] else []
-    except:
-        buttons = []
-    
+
+    if command['command_type'] == 'advanced':
+        advanced = parse_advanced_config(command)
+        buttons = advanced.get('buttons', [])[:6]
+    else:
+        buttons = parse_buttons_json(command.get('buttons'))[:6]
+
     if button_index >= len(buttons):
         await callback.answer("❌ Ошибка!")
         return
     button = buttons[button_index]
-    
-    # Обычный callback (не inline)
-    if callback.message:
-        initiator_name = "Игрок"
-        initiator_username = None
-        try:
-            initiator_chat = await bot.get_chat(initiator_id)
-            initiator_name = initiator_chat.first_name or "Игрок"
-            initiator_username = initiator_chat.username
-        except:
-            entities = callback.message.entities or []
-            initiator_name = entities[0].text if len(entities) > 0 else "Игрок"
-
-        target_name = callback.from_user.first_name or "Игрок"
-        target_username = callback.from_user.username
-
-        if initiator_username:
-            initiator_link = f"<a href=\"https://t.me/{html.escape(initiator_username)}\">{html.escape(initiator_name)}</a>"
-        else:
-            initiator_link = f"<a href=\"tg://user?id={initiator_id}\">{html.escape(initiator_name)}</a>"
-
-        if target_username:
-            target_link = f"<a href=\"https://t.me/{html.escape(target_username)}\">{html.escape(target_name)}</a>"
-        else:
-            target_link = f"<a href=\"tg://user?id={target_id}\">{html.escape(target_name)}</a>"
-
-        result_text = f"{initiator_link} {html.escape(button['result'])} {target_link}"
-
-        await callback.message.edit_text(result_text, parse_mode="HTML", disable_web_page_preview=True)
-        await callback.answer()
-        return
-    
-    # Inline callback
-    inline_message_id = callback.inline_message_id
-    if not inline_message_id:
-        await callback.answer("❌ Не удалось обработать кнопку", show_alert=True)
-        return
     
     initiator_name = "Игрок"
     initiator_username = None
@@ -2560,24 +3283,30 @@ async def rp_button_press(callback: types.CallbackQuery):
         initiator_chat = await bot.get_chat(initiator_id)
         initiator_name = initiator_chat.first_name or "Игрок"
         initiator_username = initiator_chat.username
-    except:
+    except Exception:
         initiator_user = await get_user(initiator_id)
         initiator_name = initiator_user['nickname'] if initiator_user else "Игрок"
 
     target_name = callback.from_user.first_name or "Игрок"
     target_username = callback.from_user.username
 
-    if initiator_username:
-        initiator_link = f"<a href=\"https://t.me/{html.escape(initiator_username)}\">{html.escape(initiator_name)}</a>"
-    else:
-        initiator_link = f"<a href=\"tg://user?id={initiator_id}\">{html.escape(initiator_name)}</a>"
+    initiator_link = format_user_link_html(initiator_id, initiator_name, initiator_username)
+    target_link = format_user_link_html(target_id if target_id > 0 else callback.from_user.id, target_name, target_username)
 
-    if target_username:
-        target_link = f"<a href=\"https://t.me/{html.escape(target_username)}\">{html.escape(target_name)}</a>"
+    if command['command_type'] == 'advanced':
+        result_text = apply_advanced_template(button.get('result_template') or '', initiator_link, target_link)
     else:
-        target_link = f"<a href=\"tg://user?id={target_id}\">{html.escape(target_name)}</a>"
+        result_text = f"{initiator_link} {html.escape(button['result'])} {target_link}"
 
-    result_text = f"{initiator_link} {html.escape(button['result'])} {target_link}"
+    if callback.message:
+        await callback.message.edit_text(result_text, parse_mode="HTML", disable_web_page_preview=True)
+        await callback.answer()
+        return
+
+    inline_message_id = callback.inline_message_id
+    if not inline_message_id:
+        await callback.answer("❌ Не удалось обработать кнопку", show_alert=True)
+        return
 
     await bot.edit_message_text(
         text=result_text,
@@ -3267,22 +3996,34 @@ async def admin_command_view_render(callback: types.CallbackQuery, command_id: i
         await callback.answer("❌ Команда не найдена", show_alert=True)
         return
 
-    type_text = "👤 Для себя" if command['command_type'] == 'self' else "👥 Для другого"
+    type_text = "👤 Для себя" if command['command_type'] == 'self' else ("👥 Для другого" if command['command_type'] == 'target' else "🧩 Расширенный")
     visibility_text = "🔒 Приватная" if command.get('visibility') == 'private' else "🌐 Публичная"
     status_text = "✅ Активна" if command.get('is_active') else "🗑️ Удалена"
 
     created_human = format_db_datetime(command.get('created_at'))
 
     buttons_preview = "-"
+    text_preview = html.escape(command.get('text_before') or '-')
     if command['command_type'] == 'target':
         try:
             btns = json.loads(command.get('buttons') or '[]')
             if btns:
-                buttons_preview = "\n".join([f"• {html.escape(b.get('name', ''))} → {html.escape(b.get('result', ''))}" for b in btns[:5]])
+                buttons_preview = "\n".join([f"• {html.escape(b.get('name', ''))} → {html.escape(b.get('result', ''))}" for b in btns[:6]])
             else:
                 buttons_preview = "(кнопок нет)"
         except Exception:
             buttons_preview = "(ошибка чтения кнопок)"
+    elif command['command_type'] == 'advanced':
+        advanced = parse_advanced_config(command)
+        text_preview = html.escape(advanced.get('template') or command.get('text_before') or '-')
+        btns = advanced.get('buttons', [])[:6]
+        if btns:
+            buttons_preview = "\n".join([
+                f"• [{html.escape((b.get('style') or 'default'))}] {html.escape(b.get('name', ''))} → {html.escape(b.get('result_template', ''))}"
+                for b in btns
+            ])
+        else:
+            buttons_preview = "(кнопок нет)"
 
     text = (
         f"🎯 <b>Команда #{command['id']}</b>\n\n"
@@ -3291,7 +4032,7 @@ async def admin_command_view_render(callback: types.CallbackQuery, command_id: i
         f"Тип: {type_text}\n"
         f"Видимость: {visibility_text}\n"
         f"Статус: {status_text}\n"
-        f"Текст: {html.escape(command.get('text_before') or '-')}\n"
+        f"Текст: {text_preview}\n"
         f"Кнопки:\n{buttons_preview}\n"
         f"Автор: <b>{html.escape(command['creator_nickname'])}</b> (<code>{command['creator_id']}</code>)\n"
         f"Public ID: <code>{command.get('public_id') or '-'}</code>\n"
